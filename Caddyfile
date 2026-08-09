@@ -1,0 +1,14 @@
+{$MCP_DOMAIN} {
+	# Access logs deliberately omit headers: every request carries a live Seafile
+	# token in Authorization, and logging it would defeat the redaction the
+	# application itself performs.
+	log {
+		output stdout
+		format json
+	}
+
+	reverse_proxy seafile-mcp:8000 {
+		# Streamable HTTP keeps responses open; don't let the proxy cut them short.
+		flush_interval -1
+	}
+}

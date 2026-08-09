@@ -1,0 +1,39 @@
+services:
+  seafile-mcp:
+    build: .
+    restart: unless-stopped
+    environment:
+      # The one required setting. Deployment-fixed on purpose: letting a caller
+      # choose the upstream would let them harvest tokens via a host they control.
+      SEAFILE_SERVER_URL: ${SEAFILE_SERVER_URL:?set SEAFILE_SERVER_URL in .env}
+      SEAFILE_MCP_MODE: ${SEAFILE_MCP_MODE:-safe_write}
+      SEAFILE_MCP_MAX_UPLOAD_MB: ${SEAFILE_MCP_MAX_UPLOAD_MB:-50}
+      SEAFILE_MCP_MAX_DELETE_ITEMS: ${SEAFILE_MCP_MAX_DELETE_ITEMS:-50}
+      SEAFILE_MCP_ALLOWED_EMAIL_DOMAINS: ${SEAFILE_MCP_ALLOWED_EMAIL_DOMAINS:-}
+      SEAFILE_MCP_ENABLE_SEARCH: ${SEAFILE_MCP_ENABLE_SEARCH:-}
+    # No `ports:` — the only way in is through Caddy.
+    networks: [internal]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      MCP_DOMAIN: ${MCP_DOMAIN:?set MCP_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Named volumes so issued TLS certificates survive a restart; without
+      # these you will re-request certificates and can hit rate limits.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [seafile-mcp]
+    networks: [internal]
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal:
