@@ -58,6 +58,18 @@ SEAFILE_MCP_ALLOWED_EMAIL_DOMAINS=uni-osnabrueck.de,example.org
 This applies to account tokens, where the server can read the account's email. Library
 tokens are anonymous by design and are unaffected.
 
+## PDF preview length
+
+Most libraries are mostly PDFs, so `seafile_read_file` extracts their text layer. A bare
+call on a document longer than `SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES` (default 15)
+returns only a short preview, to keep a single call cheap; the model is expected to
+follow up with `start_page`/`end_page` for a specific range. Set it to `all` to disable
+previewing entirely and always extract the whole document:
+
+```bash
+SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES=all
+```
+
 ## Search
 
 Seafile's file search is a **Professional-edition** feature. On startup the server probes

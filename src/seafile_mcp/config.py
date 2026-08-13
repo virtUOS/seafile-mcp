@@ -14,6 +14,8 @@ from typing import Annotated
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from .documents import DEFAULT_PDF_PREVIEW_THRESHOLD_PAGES
+
 
 class Mode(str, Enum):
     """Which tools this deployment is willing to expose.
@@ -76,6 +78,11 @@ class Settings(BaseSettings):
     max_file_read_kb: int = 512
     max_delete_items: int = 50
 
+    #: A bare seafile_read_file call on a PDF longer than this extracts only
+    #: a short preview instead of the whole document (see documents.py). Set
+    #: to "all" to always extract the whole document regardless of length.
+    pdf_preview_threshold_pages: int | None = DEFAULT_PDF_PREVIEW_THRESHOLD_PAGES
+
     #: If set, account-mode users outside these domains are rejected.
     #: NoDecode: this is a plain comma-separated list, not JSON.
     allowed_email_domains: Annotated[tuple[str, ...], NoDecode] = ()
@@ -102,6 +109,23 @@ class Settings(BaseSettings):
     def _split_domains(cls, v: object) -> object:
         if isinstance(v, str):
             return tuple(d.strip().lower() for d in v.split(",") if d.strip())
+        return v
+
+    @field_validator("pdf_preview_threshold_pages", mode="before")
+    @classmethod
+    def _parse_preview_threshold(cls, v: object) -> object:
+        if isinstance(v, str) and v.strip().lower() == "all":
+            return None
+        return v
+
+    @field_validator("pdf_preview_threshold_pages")
+    @classmethod
+    def _validate_preview_threshold(cls, v: int | None) -> int | None:
+        if v is not None and v < 1:
+            raise ValueError(
+                "SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES must be a positive "
+                'integer, or "all" to always extract the whole document'
+            )
         return v
 
     def allows(self, tool_name: str) -> bool:

@@ -9,3 +9,4 @@ build/
 .git/
 tests/
 docs/
+scripts/
