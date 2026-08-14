@@ -246,14 +246,17 @@ class SeafileClient:
     # writing
     # ------------------------------------------------------------------ #
 
-    async def get_upload_link(self, repo_id: str | None) -> str:
+    async def get_upload_link(self, repo_id: str | None, parent_dir: str = "/") -> str:
+        p = normalize_path(parent_dir)
         if self._creds.mode is TokenMode.repo:
             url = await self._get_json(
-                self._url("/api/v2.1/via-repo-token/upload-link/")
+                self._url("/api/v2.1/via-repo-token/upload-link/"), params={"p": p}
             )
         else:
             rid = self._require_repo_id(repo_id)
-            url = await self._get_json(self._url(f"/api2/repos/{rid}/upload-link/"))
+            url = await self._get_json(
+                self._url(f"/api2/repos/{rid}/upload-link/"), params={"p": p}
+            )
         if isinstance(url, dict):
             url = url.get("upload_link") or url.get("url") or ""
         return assert_same_host(str(url))
@@ -266,9 +269,10 @@ class SeafileClient:
         data: bytes,
         replace: bool = True,
     ) -> None:
-        link = await self.get_upload_link(repo_id)
+        p = normalize_path(parent_dir)
+        link = await self.get_upload_link(repo_id, p)
         form = {
-            "parent_dir": normalize_path(parent_dir),
+            "parent_dir": p,
             "replace": "1" if replace else "0",
         }
         files = {"file": (filename, data)}

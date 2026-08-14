@@ -60,6 +60,17 @@ SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES=30    # preview only past 30 pages
 SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES=all   # never preview; always extract the whole document
 ```
 
+## Agent skill
+
+[`skills/seafile-mcp-tools`](skills/seafile-mcp-tools) is a
+skill documenting the tool-selection pitfalls above plus one this README doesn't
+cover: saving PDF/Word/Excel/PowerPoint files, which `seafile_write_file` will
+silently corrupt since it only ever sends UTF-8 text. It bundles a tested
+generator script per format so an agent doesn't have to build these binary
+formats by hand. The skill assumes the agent has access to a sandbox or other
+environment where it can execute code (a shell and Python) — without one, those
+document formats can't be produced through this server at all.
+
 ## Running it
 
 See [docs/clients.md](docs/clients.md) for client configuration (LibreChat, Claude Desktop,
