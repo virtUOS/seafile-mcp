@@ -249,8 +249,12 @@ class SeafileClient:
     async def get_upload_link(self, repo_id: str | None, parent_dir: str = "/") -> str:
         p = normalize_path(parent_dir)
         if self._creds.mode is TokenMode.repo:
+            # Unlike every other via-repo-token endpoint (dir, download-link),
+            # Seahub's ViaRepoUploadLinkView reads the query param as "path",
+            # not "p" — sending "p" here is silently ignored and Seahub mints
+            # the token for "/" instead, which then 403s at actual-upload time.
             url = await self._get_json(
-                self._url("/api/v2.1/via-repo-token/upload-link/"), params={"p": p}
+                self._url("/api/v2.1/via-repo-token/upload-link/"), params={"path": p}
             )
         else:
             rid = self._require_repo_id(repo_id)

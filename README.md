@@ -1,4 +1,4 @@
-# seafile-mcp
+# Seafile-mcp
 
 An MCP server for [Seafile](https://www.seafile.com/), designed for **multi-user
 deployments**: one server instance serves many people, and each user supplies their own

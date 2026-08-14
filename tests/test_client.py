@@ -151,14 +151,17 @@ async def test_upload_link_on_foreign_host_is_refused():
             await SeafileClient(ACCOUNT).get_upload_link("r1")
 
 
-async def test_upload_link_is_requested_for_the_upload_directory():
-    # Seafile scopes an upload link to the exact `p` directory it was minted
-    # for and rejects a `parent_dir` that doesn't match, so the link request
-    # must carry the same destination path as the upload itself.
+async def test_upload_link_is_requested_for_the_upload_directory_repo_token():
+    # Seahub's ViaRepoUploadLinkView reads the query param as "path" (unlike
+    # every other via-repo-token endpoint's "p" sibling on api2) and mints the
+    # upload token scoped to whatever directory that names. If we send the
+    # wrong param name it's silently ignored, Seahub scopes the token to "/",
+    # and the follow-up upload 403s because the fileserver strictly matches
+    # the token's directory against the POSTed parent_dir.
     with respx.mock:
         link_route = respx.get(
             f"{SERVER}/api/v2.1/via-repo-token/upload-link/",
-            params={"p": "/reports"},
+            params={"path": "/reports"},
         ).mock(return_value=httpx.Response(200, json=f"{SERVER}/upload-api/tok"))
         upload_route = respx.post(f"{SERVER}/upload-api/tok").mock(
             return_value=httpx.Response(200, text='"ok"')
@@ -166,6 +169,23 @@ async def test_upload_link_is_requested_for_the_upload_directory():
         await SeafileClient(REPO).upload_bytes(None, "/reports", "a.txt", b"hi")
     assert link_route.called
     assert upload_route.calls.last.request.read().count(b'name="parent_dir"')
+    assert b"/reports" in upload_route.calls.last.request.read()
+
+
+async def test_upload_link_is_requested_for_the_upload_directory_account_token():
+    # The account-token endpoint (api2) uses "p", not "path" — the opposite of
+    # the via-repo-token endpoint above. Pin both so a future edit can't
+    # accidentally swap them or unify them onto the wrong name.
+    with respx.mock:
+        link_route = respx.get(
+            f"{SERVER}/api2/repos/r1/upload-link/",
+            params={"p": "/reports"},
+        ).mock(return_value=httpx.Response(200, json=f"{SERVER}/upload-api/tok"))
+        upload_route = respx.post(f"{SERVER}/upload-api/tok").mock(
+            return_value=httpx.Response(200, text='"ok"')
+        )
+        await SeafileClient(ACCOUNT).upload_bytes("r1", "/reports", "a.txt", b"hi")
+    assert link_route.called
     assert b"/reports" in upload_route.calls.last.request.read()
 
 

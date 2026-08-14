@@ -73,6 +73,24 @@ The server auto-detects which kind of token you supplied, so the same field work
 client sends. If your client reserves the `Authorization` header, send `X-Seafile-Token`
 instead.
 
+### Zoo Code 
+[Zoo Code](https://docs.zoocode.dev/features/mcp/using-mcp-in-roo?utm_source=extension&utm_medium=ide&utm_campaign=mcp_edit_settings#editing-mcp-settings-files) Integration. Add configuration to `mcp_settings.json`
+
+```json
+{
+  "mcpServers": {
+    "seafile": {
+      "type": "streamable-http",
+      "url": "https://seafile-mcp.example.org/mcp",
+      "headers": {
+        "Authorization": "YOUR_SEAFILE_TOKEN"
+      }
+    }
+  }
+}
+```
+
+
 ### Running it locally over stdio
 
 No Docker and no server required; single user, credential from your own config.
