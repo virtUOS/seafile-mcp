@@ -67,9 +67,9 @@ skill documenting the tool-selection pitfalls above plus one this README doesn't
 cover: saving PDF/Word/Excel/PowerPoint files, which `seafile_write_file` will
 silently corrupt since it only ever sends UTF-8 text. It bundles a tested
 generator script per format so an agent doesn't have to build these binary
-formats by hand. The skill assumes the agent has access to a sandbox or other
+formats by hand. **The skill assumes the agent has access to a sandbox or other
 environment where it can execute code (a shell and Python) — without one, those
-document formats can't be produced through this server at all.
+document formats can't be produced through this server at all.**
 
 ## Running it
 
