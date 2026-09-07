@@ -1,6 +1,6 @@
 ---
 name: seafile-mcp-tools
-description: Use when calling seafile-mcp tools (seafile_list_libraries, seafile_get_library_info, seafile_list_directory, seafile_read_file, seafile_get_file_info, seafile_get_download_link, seafile_search, seafile_write_file, seafile_upload_file, seafile_create_directory, seafile_rename, seafile_move, seafile_copy, seafile_delete) to browse, read, search, or modify files in a connected Seafile library. Explains which tools work with which token type, the PDF text-extraction preview/page-range workflow, how to correctly save PDF/Word/Excel/PowerPoint files (a bundled sandbox script per format), why some tools may not appear in your tool list at all, and the two-step delete confirmation pattern. Trigger before or during any task that reads, searches, uploads, or reorganizes files through this MCP server.
+description: Use when calling seafile-mcp tools (seafile_list_libraries, seafile_get_library_info, seafile_list_directory, seafile_read_file, seafile_get_file_info, seafile_get_download_link, seafile_search, seafile_write_file, seafile_upload_file, seafile_create_directory, seafile_rename, seafile_move, seafile_copy, seafile_delete) to browse, read, search, or modify files in a connected Seafile library. Explains which tools work with which token type, the PDF/Word/Excel/PowerPoint text-extraction preview/range workflow, how to correctly save new PDF/Word/Excel/PowerPoint files (a bundled sandbox script per format) and how to edit ones that already exist (download, edit with the real library, re-upload — no bundled script, since the edit differs every time), why some tools may not appear in your tool list at all, and the two-step delete confirmation pattern. Trigger before or during any task that reads, searches, uploads, edits, or reorganizes files through this MCP server.
 ---
 
 # Using the seafile-mcp tools
@@ -142,6 +142,66 @@ Before generating a large file (many slides, a big spreadsheet, embedded
 images), keep in mind `seafile_upload_file` enforces a per-deployment size cap
 on the decoded byte count — if you expect to be anywhere near it, say so before
 spending time building the file.
+
+## Editing an existing Word, Excel, or PowerPoint file
+
+The section above is about *creating a new* file. Changing something in one that
+already exists in the library — fix a typo in a paragraph, update one cell, retitle
+a slide — is a different workflow, and there is no dedicated "edit" tool for it: this
+server only ever moves whole files' bytes in and out (`seafile_get_download_link`,
+`seafile_upload_file`), it never parses or edits document structure itself. There's
+also no bundled script for this, unlike the generators above — the change needed is
+different every time, so write the edit yourself rather than trying to force a
+generic script to fit.
+
+The round trip is three steps, and the first one has a real gap — read the
+limitation below before promising this to a user:
+
+1. **Get the file's real bytes**, not extracted text. Do **not** start from
+   `seafile_read_file`'s output — it returns lossy, extracted plain text (no
+   formatting, and for DOCX its tables aren't even kept inline), which cannot be
+   turned back into a valid document. The only path this server currently exposes
+   is `seafile_get_download_link`, which returns a URL that something must then
+   fetch over the network — see the limitation immediately below before relying
+   on this.
+2. **In your sandbox, open those bytes with the real library for that format** —
+   `python-docx` for `.docx`, `openpyxl` for `.xlsx`, `python-pptx` for `.pptx` — make
+   the specific change with that library's API (e.g. set a paragraph's `.text`, a
+   cell's `.value`, a shape's `.text_frame.text`), and save the result back to bytes.
+   Change only what was asked; don't rebuild the file from scratch, which would throw
+   away everything else it contains.
+3. **Base64-encode the modified bytes and call `seafile_upload_file`** with the same
+   `parent_dir`/`filename` as the original, so it overwrites in place (this tool
+   always replaces an existing file of the same name). The previous version stays
+   recoverable in Seafile's file history regardless.
+
+This only works for the modern, XML-based formats those three libraries can open —
+not legacy `.doc`/`.xls`/`.ppt`, and not PDFs. A PDF has no reliable, general way to
+edit existing content in place; if a PDF genuinely needs different content, generate
+a new one with `scripts/make_pdf.py` and treat it as a new file, not an edit of the
+old one.
+
+Editing, like creating, requires a sandbox/code execution environment. Without one,
+these formats can be neither produced nor modified through this MCP server —
+say that plainly rather than attempting a text-only approximation with
+`seafile_write_file`, which will corrupt the file.
+
+**Known limitation — no-network sandboxes can't complete step 1 today.** This
+server has no tool that hands back a file's raw bytes directly. `seafile_upload_file`
+takes bytes straight in the tool call, but there is no download-side equivalent —
+only `seafile_get_download_link`, which returns a URL that has to be fetched
+separately. That fetch needs *something* with outbound network access to Seafile;
+this MCP server's own process always has that (it's how every tool call reaches
+Seafile at all), but the network access needed to actually GET that URL is not the
+same thing and is not exposed as part of any tool response. If your sandbox has no
+outbound network of its own, and nothing else in your environment can fetch an
+arbitrary HTTPS URL on your behalf, **step 1 cannot be completed** — say so plainly
+rather than guessing at a workaround (e.g. don't try to pass the link to
+`seafile_read_file` or `seafile_get_file_info`; neither returns raw bytes). This is
+a real gap in the current tool set, not something you're missing — a design note for
+closing it (a `seafile_download_file` tool that returns base64 bytes the same way
+`seafile_upload_file` accepts them) is tracked in `edit_file_plan.md` at the repo
+root.
 
 ## Writes and reorganization are safer than they look
 

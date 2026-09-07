@@ -76,13 +76,21 @@ SEAFILE_MCP_XLSX_PREVIEW_THRESHOLD_SHEETS=10    # same idea, for Excel sheet cou
 ## Agent skill
 
 [`skills/seafile-mcp-tools`](skills/seafile-mcp-tools) is a
-skill documenting the tool-selection pitfalls above plus one this README doesn't
-cover: saving PDF/Word/Excel/PowerPoint files, which `seafile_write_file` will
-silently corrupt since it only ever sends UTF-8 text. It bundles a tested
-generator script per format so an agent doesn't have to build these binary
-formats by hand. **The skill assumes the agent has access to a sandbox or other
-environment where it can execute code (a shell and Python) — without one, those
-document formats can't be produced through this server at all.**
+skill documenting the tool-selection pitfalls above plus two things this README
+doesn't cover: saving *new* PDF/Word/Excel/PowerPoint files, and editing ones that
+already exist in the library. Both require real code — `seafile_write_file` will
+silently corrupt any of them, since it only ever sends UTF-8 text. The skill bundles
+a tested generator script per format for creating new files; editing an existing one
+has no bundled script (the change is different every time), but the skill documents
+the download → edit-with-the-real-library → re-upload round trip.
+
+**This MCP server only ever moves file bytes in and out — it never parses, generates,
+or edits document structure itself.** All of that work happens in the agent's own code,
+not in this server. Concretely: **producing *or* modifying a PDF/Word/Excel/PowerPoint
+file requires the agent to have a sandbox or other environment where it can execute
+code (a shell and Python), in addition to this MCP server** — without one, these
+document formats can be neither produced nor modified through this server at all, no
+matter which tools are enabled.
 
 ## Running it
 
