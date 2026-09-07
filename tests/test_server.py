@@ -12,7 +12,14 @@ from seafile_mcp import auth
 from seafile_mcp.config import Mode, Settings, get_settings
 from seafile_mcp.server import build_server
 
-from .conftest import SERVER, pdf_with_pages
+from .conftest import (
+    CFB_MAGIC_BYTES,
+    SERVER,
+    docx_with_paragraphs,
+    pdf_with_pages,
+    pptx_with_slides,
+    xlsx_with_sheets,
+)
 
 ACCOUNT_URL = f"{SERVER}/api2/account/info/"
 REPO_URL = f"{SERVER}/api/v2.1/via-repo-token/repo-info/"
@@ -228,5 +235,124 @@ async def test_page_range_rejected_for_non_pdf_file(monkeypatch):
         respx.get(f"{SERVER}/f/abc/").mock(
             return_value=httpx.Response(200, content=b"just plain text")
         )
-        with pytest.raises(ToolError, match="apply only to PDFs"):
+        with pytest.raises(ToolError, match="applies only to PDF files"):
             await tool.fn(path="/note.txt", repo_id="r1", start_page=1, end_page=2)
+
+
+# --------------------------------------------------------------------------- #
+# Word / PowerPoint / Excel end-to-end
+# --------------------------------------------------------------------------- #
+
+
+async def test_docx_is_extracted_to_plain_text(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+    data = docx_with_paragraphs(["Hello from Word."])
+
+    with respx.mock:
+        _mock_file_download(data)
+        result = await tool.fn(path="/memo.docx", repo_id="r1")
+
+    assert "Hello from Word." in result.content
+    assert "This file was a Word document" in result.notice
+
+
+async def test_long_pptx_is_auto_previewed_with_no_range_given(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+    total = 25
+    data = pptx_with_slides([f"Slide {i + 1}" for i in range(total)])
+
+    with respx.mock:
+        _mock_file_download(data)
+        result = await tool.fn(path="/deck.pptx", repo_id="r1")
+
+    assert "Slide 1" in result.content
+    assert "Slide 4" not in result.content
+    assert f"{total} slide(s)" in result.notice
+    assert "by default because it is long" in result.notice
+
+
+async def test_explicit_slide_range_on_long_pptx_is_honored(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+    data = pptx_with_slides([f"Slide {i + 1}" for i in range(25)])
+
+    with respx.mock:
+        _mock_file_download(data)
+        result = await tool.fn(
+            path="/deck.pptx", repo_id="r1", start_slide=10, end_slide=12
+        )
+
+    assert "Slide 10" in result.content
+    assert "Slide 13" not in result.content
+    assert "by default" not in result.notice
+
+
+async def test_xlsx_previews_first_sheet_when_many_sheets(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+    sheets = {f"Sheet{i}": [[i]] for i in range(1, 8)}
+    data = xlsx_with_sheets(sheets)
+
+    with respx.mock:
+        _mock_file_download(data)
+        result = await tool.fn(path="/book.xlsx", repo_id="r1")
+
+    assert "[sheet: Sheet1]" in result.content
+    assert "[sheet: Sheet2]" not in result.content
+    assert "Sheet7" in result.notice
+
+
+async def test_xlsx_sheet_name_selects_one_sheet(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+    data = xlsx_with_sheets({"Sheet1": [[1]], "Sheet2": [["only", "this"]]})
+
+    with respx.mock:
+        _mock_file_download(data)
+        result = await tool.fn(path="/book.xlsx", repo_id="r1", sheet_name="Sheet2")
+
+    assert "only\tthis" in result.content
+    assert "[sheet: Sheet1]" not in result.content
+
+
+async def test_slide_range_rejected_for_non_pptx_file(monkeypatch):
+    from fastmcp.exceptions import ToolError
+
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(b"just plain text")
+        with pytest.raises(ToolError, match="applies only to PowerPoint files"):
+            await tool.fn(path="/note.txt", repo_id="r1", start_slide=1, end_slide=2)
+
+
+async def test_sheet_name_rejected_for_non_xlsx_file(monkeypatch):
+    from fastmcp.exceptions import ToolError
+
+    tool = await _read_file_tool(monkeypatch)
+    pdf_bytes = pdf_with_pages(1, texted=True)
+
+    with respx.mock:
+        _mock_file_download(pdf_bytes)
+        with pytest.raises(ToolError, match="applies only to Excel files"):
+            await tool.fn(path="/report.pdf", repo_id="r1", sheet_name="Sheet1")
+
+
+async def test_docx_rejects_start_page_since_no_chunking_yet(monkeypatch):
+    from fastmcp.exceptions import ToolError
+
+    tool = await _read_file_tool(monkeypatch)
+    data = docx_with_paragraphs(["Hello."])
+
+    with respx.mock:
+        _mock_file_download(data)
+        with pytest.raises(ToolError, match="applies only to PDF files"):
+            await tool.fn(path="/memo.docx", repo_id="r1", start_page=1)
+
+
+async def test_legacy_or_encrypted_office_file_raises_clear_error(monkeypatch):
+    from fastmcp.exceptions import ToolError
+
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(CFB_MAGIC_BYTES)
+        with pytest.raises(ToolError, match="password-protected"):
+            await tool.fn(path="/old.doc", repo_id="r1")

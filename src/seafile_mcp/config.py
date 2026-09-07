@@ -11,10 +11,31 @@ from enum import Enum
 from functools import lru_cache
 from typing import Annotated
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from .documents import DEFAULT_PDF_PREVIEW_THRESHOLD_PAGES
+from .documents import (
+    DEFAULT_PDF_PREVIEW_THRESHOLD_PAGES,
+    DEFAULT_PPTX_PREVIEW_THRESHOLD_SLIDES,
+    DEFAULT_XLSX_PREVIEW_THRESHOLD_SHEETS,
+)
+
+
+def _parse_all_or_int(v: object) -> object:
+    """Shared 'before' validator: "all" (any case/whitespace) -> None."""
+    if isinstance(v, str) and v.strip().lower() == "all":
+        return None
+    return v
+
+
+def _require_positive_or_none(v: int | None, env_name: str) -> int | None:
+    """Shared 'after' validator: reject 0 or negative."""
+    if v is not None and v < 1:
+        raise ValueError(
+            f"{env_name} must be a positive integer, or \"all\" to always "
+            f"extract everything"
+        )
+    return v
 
 
 class Mode(str, Enum):
@@ -83,6 +104,14 @@ class Settings(BaseSettings):
     #: to "all" to always extract the whole document regardless of length.
     pdf_preview_threshold_pages: int | None = DEFAULT_PDF_PREVIEW_THRESHOLD_PAGES
 
+    #: Same idea as pdf_preview_threshold_pages, for PowerPoint slides.
+    pptx_preview_threshold_slides: int | None = DEFAULT_PPTX_PREVIEW_THRESHOLD_SLIDES
+
+    #: Same idea, for Excel workbooks: above this many sheets, a bare call
+    #: extracts only the first sheet instead of all of them. Set to "all" to
+    #: always extract every sheet regardless of count.
+    xlsx_preview_threshold_sheets: int | None = DEFAULT_XLSX_PREVIEW_THRESHOLD_SHEETS
+
     #: If set, account-mode users outside these domains are rejected.
     #: NoDecode: this is a plain comma-separated list, not JSON.
     allowed_email_domains: Annotated[tuple[str, ...], NoDecode] = ()
@@ -111,22 +140,24 @@ class Settings(BaseSettings):
             return tuple(d.strip().lower() for d in v.split(",") if d.strip())
         return v
 
-    @field_validator("pdf_preview_threshold_pages", mode="before")
+    @field_validator(
+        "pdf_preview_threshold_pages",
+        "pptx_preview_threshold_slides",
+        "xlsx_preview_threshold_sheets",
+        mode="before",
+    )
     @classmethod
     def _parse_preview_threshold(cls, v: object) -> object:
-        if isinstance(v, str) and v.strip().lower() == "all":
-            return None
-        return v
+        return _parse_all_or_int(v)
 
-    @field_validator("pdf_preview_threshold_pages")
+    @field_validator(
+        "pdf_preview_threshold_pages",
+        "pptx_preview_threshold_slides",
+        "xlsx_preview_threshold_sheets",
+    )
     @classmethod
-    def _validate_preview_threshold(cls, v: int | None) -> int | None:
-        if v is not None and v < 1:
-            raise ValueError(
-                "SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES must be a positive "
-                'integer, or "all" to always extract the whole document'
-            )
-        return v
+    def _validate_preview_threshold(cls, v: int | None, info: ValidationInfo) -> int | None:
+        return _require_positive_or_none(v, f"SEAFILE_MCP_{info.field_name.upper()}")
 
     def allows(self, tool_name: str) -> bool:
         """True if `tool_name` should be registered under the active mode."""

@@ -37,27 +37,40 @@ Nothing this server exposes can irreversibly destroy data: deletes go to the lib
 and overwrites create a new version in file history. The trash purge endpoint is
 deliberately not wrapped as a tool.
 
-## Reading PDFs
-(This feature is still under development, parsing functionality will be extended)
+## Reading documents
 
-Most files in a typical Seafile library are PDFs, so `seafile_read_file` extracts their
-text layer instead of returning raw bytes as mojibake. There is no OCR — a scanned or
-image-only PDF comes back with an explicit notice instead of an error or garbage — and
-layout, tables, and images are not preserved.
+(Under Development)
 
-A bare call returns the whole document, except that a PDF longer than a configurable
-page threshold (15 pages by default) is previewed (first 2 pages only) instead, to
-keep a single call cheap; pass `start_page`/`end_page` (1-indexed, inclusive) to read
-a specific range instead. The response's `notice` field always states the document's
-true page count and whether what you got was a preview or the full text, so the two
-are never ambiguous.
+`seafile_read_file` extracts real text from PDF, Word, PowerPoint, and Excel files
+instead of returning their raw bytes as mojibake. There is no OCR anywhere — a
+scanned/image-only PDF or a textless slide/sheet comes back with an explicit notice
+instead of an error or garbage — and formatting, layout, and images are never
+preserved.
 
-System admins can tune or disable the threshold with
-`SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES`:
+PDF pages and PowerPoint slides are chunkable: a bare call returns the whole
+document/deck, except that one longer than a configurable threshold (15 pages / 20
+slides by default) is previewed instead (first 2 pages / first 3 slides), to keep a
+single call cheap. Pass `start_page`/`end_page` or `start_slide`/`end_slide`
+(1-indexed, inclusive) to read a specific range instead. Excel workbooks are chunked
+by sheet rather than by number: a bare call returns every sheet if there aren't many
+(5 by default), or just the first if there are — pass `sheet_name` to read one
+specific sheet in full. In every case the response's `notice` field states the true
+total (pages/slides/sheets) and whether what you got was a preview or everything, so
+the two are never ambiguous. Word documents are always extracted in full — Word
+stores no page boundaries in the file itself, so there's no natural unit to chunk by
+yet.
+
+A legacy pre-2007 binary Office file (`.doc`/`.xls`/`.ppt`) or a password-protected
+`.docx`/`.xlsx`/`.pptx` can't be parsed at all and raises a clear error rather than
+falling through to mojibake.
+
+System admins can tune or disable each preview threshold independently:
 
 ```bash
-SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES=30    # preview only past 30 pages
-SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES=all   # never preview; always extract the whole document
+SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES=30      # preview only past 30 pages
+SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES=all     # never preview; always extract the whole PDF
+SEAFILE_MCP_PPTX_PREVIEW_THRESHOLD_SLIDES=30    # same idea, for PowerPoint slides
+SEAFILE_MCP_XLSX_PREVIEW_THRESHOLD_SHEETS=10    # same idea, for Excel sheet counts
 ```
 
 ## Agent skill

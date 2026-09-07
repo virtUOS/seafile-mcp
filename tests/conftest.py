@@ -54,6 +54,58 @@ def encrypted_pdf(count: int) -> bytes:
     return buf.getvalue()
 
 
+def docx_with_paragraphs(paragraphs: list[str], *, tables: list[list[list[str]]] = ()) -> bytes:
+    """Build a minimal .docx with the given paragraph texts and table rows."""
+    from docx import Document
+
+    doc = Document()
+    for text in paragraphs:
+        doc.add_paragraph(text)
+    for rows in tables:
+        table = doc.add_table(rows=len(rows), cols=len(rows[0]))
+        for r, row in enumerate(rows):
+            for c, value in enumerate(row):
+                table.cell(r, c).text = value
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def pptx_with_slides(slide_texts: list[str]) -> bytes:
+    """Build a minimal .pptx with one title-only slide per entry in `slide_texts`."""
+    from pptx import Presentation
+
+    prs = Presentation()
+    layout = prs.slide_layouts[5]  # "Title Only"
+    for text in slide_texts:
+        slide = prs.slides.add_slide(layout)
+        slide.shapes.title.text = text
+    buf = BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def xlsx_with_sheets(sheets: dict[str, list[list[object]]]) -> bytes:
+    """Build a minimal .xlsx with one sheet per (name, rows) entry in `sheets`."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    for name, rows in sheets.items():
+        ws = wb.create_sheet(title=name)
+        for row in rows:
+            ws.append(row)
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+#: Minimal bytes recognized as an OLE2/CFB container (legacy or encrypted
+#: Office file) by documents.is_legacy_or_encrypted_office. The magic number
+#: alone is enough; no real encrypted file needed.
+CFB_MAGIC_BYTES = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 32
+
+
 @pytest.fixture(autouse=True)
 def _env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SEAFILE_SERVER_URL", SERVER)
