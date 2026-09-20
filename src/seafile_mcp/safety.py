@@ -42,6 +42,17 @@ _TOKEN_PATTERNS = (
 
 _REDACTED = "<redacted>"
 
+#: Seafile library ids are UUIDs. They are not credentials, but they name one
+#: person's library, and logs are kept and shipped around — so keep enough to
+#: correlate entries with each other and no more. Truncating here rather than at
+#: each call site covers the ones nobody remembered: a URL path, an exception
+#: message, a traceback.
+_UUID_PATTERN = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_UUID_KEEP = 8
+
 #: Used to render tracebacks inside the filter, before a handler can emit them raw.
 _EXC_FORMATTER = logging.Formatter()
 
@@ -49,7 +60,7 @@ _EXC_FORMATTER = logging.Formatter()
 def redact(text: str) -> str:
     for pattern in _TOKEN_PATTERNS:
         text = pattern.sub(_REDACTED, text)
-    return text
+    return _UUID_PATTERN.sub(lambda m: m.group(0)[:_UUID_KEEP] + "...", text)
 
 
 class RedactingFilter(logging.Filter):
@@ -57,9 +68,21 @@ class RedactingFilter(logging.Filter):
 
     Applied to the root logger so a stray ``logger.debug(response.text)`` or an
     exception carrying a URL cannot leak a live token into ``docker logs``.
+    Library ids are shortened rather than removed: they identify whose library a
+    line is about, but they are still wanted for correlating entries.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # Render the message *here*, then scrub the result. Redacting the args
+        # individually is not enough: only some of them are strings, and
+        # ``logger.error("failed: %s", exc)`` — an exception carrying an upstream
+        # response body — would otherwise sail straight through untouched.
+        try:
+            record.msg = record.getMessage()
+            record.args = ()
+        except Exception:  # pragma: no cover - a malformed format string
+            pass  # fall through to the per-arg pass below
+
         if isinstance(record.msg, str):
             record.msg = redact(record.msg)
         if record.args:
@@ -236,7 +259,7 @@ def audit(
         tool,
         creds.mode.value,
         _key(creds)[:12],
-        repo_id or "-",
+        (repo_id[:8] + "...") if repo_id else "-",
         path or "-",
         outcome,
     )

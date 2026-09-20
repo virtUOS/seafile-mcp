@@ -45,6 +45,49 @@ def test_sentinel_token_never_reaches_the_log(caplog):
     assert SENTINEL not in caplog.text
 
 
+@pytest.mark.parametrize(
+    "emit",
+    [
+        pytest.param(lambda log, tok: log.info(f"Token {tok}"), id="bare-message"),
+        pytest.param(lambda log, tok: log.info("%s", f"Token {tok}"), id="str-arg"),
+        pytest.param(
+            lambda log, tok: log.info("failed: %s", RuntimeError(f"Token {tok}")),
+            id="exception-arg",
+        ),
+        pytest.param(lambda log, tok: log.info(RuntimeError(f"Token {tok}")), id="exception-message"),
+        pytest.param(lambda log, tok: log.info("%s", [tok]), id="list-arg"),
+        pytest.param(lambda log, tok: log.info("%s", {"auth": tok}), id="dict-arg"),
+    ],
+)
+def test_no_log_arg_shape_can_smuggle_a_token_out(emit, caplog):
+    """Only some args are strings.
+
+    Redacting them one by one let an exception — which is what a caller most often
+    logs, and which here carries an upstream response body — through untouched.
+    """
+    logger = logging.getLogger("seafile_mcp.test.args")
+    logger.addFilter(safety.RedactingFilter())
+
+    with caplog.at_level(logging.DEBUG):
+        emit(logger, SENTINEL)
+
+    assert SENTINEL not in caplog.text
+
+
+def test_library_ids_are_shortened_not_removed(caplog):
+    """Enough to correlate log lines with each other, not enough to be a record."""
+    library = "8f2c9b10-4d3e-4a7f-9c21-5e6a7b8c9d01"
+    logger = logging.getLogger("seafile_mcp.test.uuid")
+    logger.addFilter(safety.RedactingFilter())
+
+    with caplog.at_level(logging.DEBUG):
+        logger.info("GET /api2/repos/%s/dir/", library)
+        logger.info("refused: %s", ValueError(f"confined to {library}"))
+
+    assert library not in caplog.text
+    assert caplog.text.count("8f2c9b10...") == 2
+
+
 def test_sentinel_is_redacted_from_tracebacks(caplog):
     logger = logging.getLogger("seafile_mcp.test.exc")
     logger.addFilter(safety.RedactingFilter())

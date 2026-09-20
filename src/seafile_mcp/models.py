@@ -42,7 +42,9 @@ class Credentials(BaseModel):
     pinned_repo_id: str | None = None
 
     def __str__(self) -> str:  # pragma: no cover - defensive
-        pin = f", repo={self.pinned_repo_id}" if self.pinned_repo_id else ""
+        # Shortened for the same reason the audit log shortens it: enough to tell
+        # which library a line concerns, not enough to be a record of it.
+        pin = f", repo={self.pinned_repo_id[:8]}..." if self.pinned_repo_id else ""
         return f"Credentials(mode={self.mode.value}{pin})"
 
 
