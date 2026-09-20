@@ -12,6 +12,11 @@ on the *kind* of token supplied:
     publishes **no** delete, move, copy or search endpoint for library tokens, so
     those raise :class:`UnsupportedOperation` rather than being faked.
 
+An account token may additionally be *pinned* to one library (see
+:func:`seafile_mcp.auth.split_pin`). The pin is enforced here rather than per tool:
+everything that names a library resolves it through :meth:`SeafileClient._pin_or`,
+so a pinned credential stays confined even through tools written later.
+
 API reference: https://seafile-api.readme.io/ and
 https://plus.seafile.com/published/web-api/v2.1/library-api-tokens.md
 """
@@ -89,7 +94,27 @@ class SeafileClient:
                 f"if you need this operation."
             )
 
+    def _pin_or(self, repo_id: str | None) -> str | None:
+        """Resolve a requested library against a repo-pinned credential.
+
+        Every operation that names a library goes through here, so a pinned
+        credential is confined no matter which tool is called — including tools
+        added later. A mismatch is refused rather than quietly redirected: the
+        alternative hands the caller one library's file while it believes it asked
+        for another's.
+        """
+        pinned = self._creds.pinned_repo_id
+        if pinned is None:
+            return repo_id
+        if repo_id and repo_id != pinned:
+            raise UnsupportedOperation(
+                f"This credential is confined to library {pinned!r}; it cannot be "
+                f"used with library {repo_id!r}."
+            )
+        return pinned
+
     def _require_repo_id(self, repo_id: str | None) -> str:
+        repo_id = self._pin_or(repo_id)
         if self._creds.mode is TokenMode.account and not repo_id:
             raise ValueError(
                 "repo_id is required when using an account token. Call "
@@ -119,7 +144,10 @@ class SeafileClient:
     # ------------------------------------------------------------------ #
 
     async def list_libraries(self) -> list[LibraryInfo]:
-        if self._creds.mode is TokenMode.repo:
+        # A pinned credential sees only its own library, exactly as a library token
+        # does. Without this the account-wide listing would keep handing back every
+        # other library's id and name, which is most of what the pin exists to stop.
+        if self._creds.mode is TokenMode.repo or self._creds.pinned_repo_id:
             return [await self.get_library_info(None)]
         data = await self._get_json(self._url("/api2/repos/"))
         return [
@@ -356,6 +384,10 @@ class SeafileClient:
         dst_repo_id: str | None,
     ) -> str:
         rid = self._require_repo_id(repo_id)
+        # The destination needs the same check as the source: copying *into* another
+        # library never requires reading it, so leaving this unpinned would be a way
+        # out of the pinned library.
+        dst_repo = self._pin_or(dst_repo_id) or rid
         p = normalize_path(path)
         dst = normalize_path(dst_dir)
         kind = await self._entry_kind(repo_id, p)
@@ -366,7 +398,7 @@ class SeafileClient:
             params={"p": p},
             data={
                 "operation": operation,
-                "dst_repo": dst_repo_id or rid,
+                "dst_repo": dst_repo,
                 "dst_dir": dst,
             },
         )
@@ -390,6 +422,8 @@ class SeafileClient:
         self, query: str, repo_id: str | None = None, limit: int = 25
     ) -> list[FileInfo]:
         self._require_account("search")
+        # repo_id is optional here, so this never reaches _require_repo_id.
+        repo_id = self._pin_or(repo_id)
         params: dict[str, Any] = {"q": query, "per_page": limit}
         if repo_id:
             params["search_repo"] = repo_id

@@ -73,6 +73,76 @@ async def test_full_mode_exposes_the_fourteen_planned_tools():
     assert len(names) == 14, sorted(names)
 
 
+async def _search_tool(monkeypatch, token: str = "acct"):
+    monkeypatch.setattr(
+        auth, "get_http_headers", lambda **kw: {"authorization": f"Token {token}"}
+    )
+    server = build_server(search_enabled=True, settings=_settings(Mode.full))
+    return await server.get_tool("seafile_search")
+
+
+async def test_search_reports_no_results_with_the_query(monkeypatch):
+    tool = await _search_tool(monkeypatch)
+
+    with respx.mock:
+        respx.get(ACCOUNT_URL).mock(
+            return_value=httpx.Response(200, json={"email": "a@b.c"})
+        )
+        respx.get(f"{SERVER}/api2/search/").mock(
+            return_value=httpx.Response(200, json={"results": []})
+        )
+        result = await tool.fn(query="missing", repo_id="r1")
+
+    assert result.results == []
+    assert result.message is not None
+    assert "missing" in result.message
+    assert "r1" in result.message
+
+
+async def test_pinned_credential_confines_search_without_naming_the_repo(monkeypatch):
+    """The agent passes no repo_id at all; the pin supplies it."""
+    tool = await _search_tool(monkeypatch, token="acct:repo_id:r1")
+
+    with respx.mock:
+        respx.get(ACCOUNT_URL).mock(
+            return_value=httpx.Response(200, json={"email": "a@b.c"})
+        )
+        respx.get(f"{SERVER}/api2/repos/r1/").mock(
+            return_value=httpx.Response(200, json={"id": "r1", "name": "Pinned"})
+        )
+        route = respx.get(f"{SERVER}/api2/search/").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"name": "a.txt", "fullpath": "/a.txt", "repo_id": "r1"}
+                    ]
+                },
+            )
+        )
+        result = await tool.fn(query="a")
+
+    assert route.calls.last.request.url.params["search_repo"] == "r1"
+    assert result.repo_id == "r1"
+    assert result.results[0].path == "/a.txt"
+
+
+async def test_pinned_credential_refuses_a_different_repo(monkeypatch):
+    from fastmcp.exceptions import ToolError
+
+    tool = await _search_tool(monkeypatch, token="acct:repo_id:r1")
+
+    with respx.mock:
+        respx.get(ACCOUNT_URL).mock(
+            return_value=httpx.Response(200, json={"email": "a@b.c"})
+        )
+        respx.get(f"{SERVER}/api2/repos/r1/").mock(
+            return_value=httpx.Response(200, json={"id": "r1"})
+        )
+        with pytest.raises(ToolError, match="confined to library 'r1'"):
+            await tool.fn(query="a", repo_id="somebody-elses-repo")
+
+
 # --------------------------------------------------------------------------- #
 # Isolation
 # --------------------------------------------------------------------------- #

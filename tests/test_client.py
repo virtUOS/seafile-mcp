@@ -19,6 +19,7 @@ from .conftest import SERVER
 
 ACCOUNT = Credentials(token="acct", mode=TokenMode.account)
 REPO = Credentials(token="repo", mode=TokenMode.repo)
+PINNED = Credentials(token="acct", mode=TokenMode.account, pinned_repo_id="mine")
 
 
 # --------------------------------------------------------------------------- #
@@ -113,6 +114,96 @@ async def test_repo_token_refuses_operations_seafile_does_not_offer(operation):
     }
     with pytest.raises(UnsupportedOperation, match="library API token"):
         await calls[operation]()
+
+
+# --------------------------------------------------------------------------- #
+# Repo-pinned credentials
+# --------------------------------------------------------------------------- #
+
+#: Every account-mode operation that names a library. A pinned credential must
+#: refuse a foreign library through all of them — this is the guard that catches a
+#: tool added later forgetting the pin, which is the main risk of enforcing it in
+#: code rather than relying on Seafile.
+PINNED_OPERATIONS = {
+    "list_directory": lambda c, rid: c.list_directory(rid, "/"),
+    "get_library_info": lambda c, rid: c.get_library_info(rid),
+    "get_file_info": lambda c, rid: c.get_file_info(rid, "/a.txt"),
+    "get_download_link": lambda c, rid: c.get_download_link(rid, "/a.txt"),
+    "get_upload_link": lambda c, rid: c.get_upload_link(rid, "/"),
+    "create_directory": lambda c, rid: c.create_directory(rid, "/new"),
+    "rename": lambda c, rid: c.rename(rid, "/a.txt", "b.txt"),
+    "move": lambda c, rid: c.move(rid, "/a.txt", "/dst"),
+    "copy": lambda c, rid: c.copy(rid, "/a.txt", "/dst"),
+    "delete": lambda c, rid: c.delete(rid, "/a.txt"),
+    "search": lambda c, rid: c.search("q", rid),
+    "count_items": lambda c, rid: c.count_items(rid, "/"),
+}
+
+
+@pytest.mark.parametrize("operation", sorted(PINNED_OPERATIONS))
+async def test_pinned_credential_refuses_every_foreign_repo_operation(operation):
+    client = SeafileClient(PINNED)
+    with pytest.raises(UnsupportedOperation, match="confined to library 'mine'"):
+        await PINNED_OPERATIONS[operation](client, "somebody-elses-repo")
+
+
+@pytest.mark.parametrize("operation", sorted(PINNED_OPERATIONS))
+async def test_pinned_credential_never_reaches_seafile_for_a_foreign_repo(operation):
+    """The refusal happens before any request, so no token is ever sent."""
+    with respx.mock(assert_all_called=False) as mock:
+        mock.route().mock(return_value=httpx.Response(200, json={}))
+        with pytest.raises(UnsupportedOperation):
+            await PINNED_OPERATIONS[operation](SeafileClient(PINNED), "foreign")
+        assert not mock.calls
+
+
+async def test_pinned_credential_supplies_the_repo_when_none_is_given():
+    with respx.mock:
+        route = respx.get(f"{SERVER}/api2/repos/mine/dir/").mock(
+            return_value=httpx.Response(200, json=[])
+        )
+        await SeafileClient(PINNED).list_directory(None, "/")
+    assert route.called
+
+
+async def test_pinned_credential_accepts_its_own_repo():
+    with respx.mock:
+        route = respx.get(f"{SERVER}/api2/repos/mine/dir/").mock(
+            return_value=httpx.Response(200, json=[])
+        )
+        await SeafileClient(PINNED).list_directory("mine", "/")
+    assert route.called
+
+
+async def test_pinned_credential_lists_only_its_own_library():
+    """Otherwise the account-wide listing hands back every other library's id."""
+    with respx.mock:
+        respx.get(f"{SERVER}/api2/repos/mine/").mock(
+            return_value=httpx.Response(200, json={"id": "mine", "name": "Mine"})
+        )
+        every_repo = respx.get(f"{SERVER}/api2/repos/").mock(
+            return_value=httpx.Response(200, json=[{"id": "other", "name": "Other"}])
+        )
+        libraries = await SeafileClient(PINNED).list_libraries()
+
+    assert not every_repo.called
+    assert [lib.id for lib in libraries] == ["mine"]
+
+
+async def test_pinned_credential_refuses_copying_out_to_another_library():
+    """Copying *into* a library needs no read access, so dst needs the same check."""
+    client = SeafileClient(PINNED)
+    with pytest.raises(UnsupportedOperation, match="confined to library 'mine'"):
+        await client.copy("mine", "/a.txt", "/dst", dst_repo_id="exfiltrate-here")
+
+
+async def test_pinned_search_scopes_the_query_to_the_pinned_library():
+    with respx.mock:
+        route = respx.get(f"{SERVER}/api2/search/").mock(
+            return_value=httpx.Response(200, json={"results": []})
+        )
+        await SeafileClient(PINNED).search("anything")
+    assert route.calls.last.request.url.params["search_repo"] == "mine"
 
 
 # --------------------------------------------------------------------------- #

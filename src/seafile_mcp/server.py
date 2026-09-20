@@ -33,6 +33,7 @@ from .models import (
     FileInfo,
     LibraryInfo,
     OperationResult,
+    SearchResult,
     SeafileMCPError,
     UNTRUSTED_NOTICE,
 )
@@ -43,7 +44,9 @@ T = TypeVar("T")
 
 REPO_ID_HELP = (
     "Library id. Required when using an account token; ignored when using a "
-    "library API token, which is already bound to one library."
+    "library API token, which is already bound to one library. If the account "
+    "token is confined to a single library, that one is always used and naming "
+    "a different one is refused."
 )
 
 
@@ -371,14 +374,31 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
         @_handle_errors
         async def seafile_search(
             query: str, repo_id: str | None = None, limit: int = 25
-        ) -> list[FileInfo]:
+        ) -> SearchResult:
             """Search for files by name or content.
 
             Requires an account token; Seafile provides no search endpoint for
-            library API tokens.
+            library API tokens. Searches every library the token can reach unless
+            repo_id narrows it to one.
+
+            Args:
+                query: What to search for.
+                repo_id: Library id to search within. Omit to search every
+                    library this token can reach. If the token is confined to a
+                    single library, that one is always used and naming a
+                    different one is refused.
+                limit: Maximum results to return.
             """
-            client, _ = await _connect()
-            return await client.search(query, repo_id, limit)
+            client, creds = await _connect()
+            results = await client.search(query, repo_id, limit)
+            scope = repo_id or creds.pinned_repo_id
+            message = None
+            if not results:
+                where = f" in library {scope!r}" if scope else ""
+                message = f"No information found with query {query!r}{where}."
+            return SearchResult(
+                query=query, repo_id=scope, results=results, message=message
+            )
 
     # ----------------------------------------------------------------- #
     # Mutating tools

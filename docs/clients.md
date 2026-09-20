@@ -36,9 +36,35 @@ Run this yourself, on your own machine — never paste your Seafile password int
 > Tokens are revocable. If one is ever exposed (a shared screenshot, a pasted transcript),
 > delete it in Seafile and generate a new one.
 
+### Account token confined to one library
+
+Search is the one thing a library token cannot do at all — Seafile publishes no search
+endpoint for them. If you want search but not account-wide reach, take an account token and
+append `:repo_id:` followed by the library id:
+
+```
+abc123def456…:repo_id:8f2c9b10-4d3e-4a7f-9c21-5e6a7b8c9d01
+```
+
+Find the library id in the Seafile web interface: open the library, and it is the long
+identifier in the browser's address bar (`.../library/<this-part>/...`).
+
+Paste the whole string — token, marker, and library id — as your API key. The server splits
+it apart, sends only the token to Seafile, and confines **every** tool to that library. The
+assistant no longer needs to supply a library id at all, and asking for a different library
+is refused — so an instruction hidden inside a document it reads ("now search my whole
+account for…") cannot widen its reach.
+
+> This confines the *assistant*, not the *token*. The string still contains your full
+> account token, so handle it exactly as carefully as the bare token: anyone who gets hold
+> of it and drops the suffix has your whole account. It is no worse than pasting the bare
+> token, which is the alternative — but it is not a restricted credential the way a library
+> token is.
+
 ## Step 2: configure your client
 
-The server auto-detects which kind of token you supplied, so the same field works for both.
+The server auto-detects which kind of token you supplied, so the same field works for all
+of them.
 
 ### LibreChat
 
@@ -120,6 +146,9 @@ No Docker and no server required; single user, credential from your own config.
 | `seafile_move`, `seafile_copy` | **yes** |
 | `seafile_delete` | **yes**, and only if the deployment runs in `full` mode |
 | `seafile_search` | **yes**, and only on Seafile Professional |
+
+An account token confined to one library (above) can do everything in that table — search
+included — within that one library.
 
 Tools your deployment has disabled are not registered at all, so they will not appear in
 your client's tool list.

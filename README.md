@@ -15,9 +15,31 @@ Two kinds of Seafile token work, and the server auto-detects which one you gave 
 |---|---|---|
 | **Library API token** (recommended) | In Seafile: library → Advanced → API Token, choose read-only or read-write | One library. Cannot delete, move, or copy — Seafile itself offers no such endpoints for these tokens. |
 | **Account token** | `POST /api2/auth-token/` with your username and password | Your whole account, all libraries. Needed for search, move, copy, and delete. |
+| **Account token, confined to one library** | Take an account token and append `:repo_id:` plus the library id — `abc123…:repo_id:8f2c…` | That one library only, through every tool. Search still works, unlike a library token. |
 
 Prefer a **read-only library token** unless you specifically need more. It is the single
 most effective way to limit what an assistant can do on your behalf.
+
+### Confining an account token to one library
+
+Search is the main reason to use an account token: Seafile offers no search endpoint for
+library tokens, so a library token cannot search at all. If you want search but not
+account-wide reach, append `:repo_id:` and the library id to your account token:
+
+```
+abc123def456…:repo_id:8f2c9b10-4d3e-4a7f-9c21-5e6a7b8c9d01
+```
+
+The server splits this apart, sends only the token to Seafile, and confines **every**
+tool to that library. The assistant can then omit `repo_id` entirely, and naming a
+different library is refused — so an instruction hidden inside a document it reads
+("now search my whole account for…") cannot widen the scope.
+
+One thing to be clear about: this confines the *assistant*, not the *token*. The string
+still contains your full account token, so treat it with exactly the care you would treat
+the bare token — anyone who obtains it and drops the suffix has your whole account. It is
+no worse than supplying the bare token (which is what you would otherwise paste), but it
+is not a restricted credential in the way a library token is.
 
 The server is a stateless pass-through: it stores no credentials, keeps no user database,
 and retains nothing between requests. Isolation between users is structural — each request

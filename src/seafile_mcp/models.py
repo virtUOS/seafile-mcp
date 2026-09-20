@@ -25,13 +25,25 @@ class TokenMode(str, Enum):
 
 
 class Credentials(BaseModel):
+    """A resolved credential. ``token`` is always the bare Seafile token.
+
+    ``pinned_repo_id`` is set when the caller supplied a composite credential
+    (``"<token>:repo_id:<library-id>"``). It confines every operation to that one
+    library, whatever ``repo_id`` a tool call names. It contains the agent — an
+    injected instruction cannot widen the scope — but it does not scope the token
+    itself: the composite string still carries a full-privilege account token
+    verbatim.
+    """
+
     model_config = {"frozen": True}
 
     token: str = Field(repr=False)
     mode: TokenMode
+    pinned_repo_id: str | None = None
 
     def __str__(self) -> str:  # pragma: no cover - defensive
-        return f"Credentials(mode={self.mode.value})"
+        pin = f", repo={self.pinned_repo_id}" if self.pinned_repo_id else ""
+        return f"Credentials(mode={self.mode.value}{pin})"
 
 
 # --------------------------------------------------------------------------- #
@@ -96,6 +108,21 @@ class FileInfo(BaseModel):
     size: int | None = None
     modified: str | None = None
     id: str | None = None
+
+
+class SearchResult(BaseModel):
+    """What a search returned, and which library it covered.
+
+    ``message`` is set only when ``results`` is empty, so a caller can tell
+    "found nothing" from "found something" without reading a list length.
+    ``repo_id`` is the library actually searched — the one asked for, or the one
+    the credential is confined to — and ``None`` when the whole account was.
+    """
+
+    query: str
+    results: list[FileInfo]
+    repo_id: str | None = None
+    message: str | None = None
 
 
 UNTRUSTED_NOTICE = (
