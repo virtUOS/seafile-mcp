@@ -29,13 +29,16 @@ from urllib.parse import quote
 
 import httpx
 
+from . import documents
 from ._http import assert_same_host, get_http_client
 from .config import get_settings
 from .models import (
     Credentials,
     DirEntry,
+    Download,
     FileInfo,
     LibraryInfo,
+    SafetyError,
     SeafileAPIError,
     TokenMode,
     UnsupportedOperation,
@@ -263,12 +266,99 @@ class SeafileClient:
             url = url.get("download_link") or url.get("url") or ""
         return assert_same_host(str(url))
 
-    async def read_file_bytes(self, repo_id: str | None, path: str) -> bytes:
+    async def read_file_bytes(self, repo_id: str | None, path: str) -> Download:
+        """Download a file, bounded by ``Settings.max_download_mb``.
+
+        Streamed rather than read in one go, and bounded by a running byte
+        count rather than by the size Seafile reports, because that size is
+        sometimes absent and always someone else's claim. This process is
+        shared by every user, so an unbounded read is an availability problem
+        rather than a slow call.
+
+        A file over the limit is not discarded outright. As soon as enough
+        bytes have arrived to recognise the format, one of two things happens:
+
+        - the format needs its whole file to parse (PDF, OOXML, OLE2), so we
+          stop immediately and raise. Returning a prefix would only produce a
+          parse error later, and this way a 2 GB PDF costs one chunk rather
+          than the full limit.
+        - anything else is text, where a prefix *is* usable, so we fill up to
+          the limit and return it flagged ``partial``.
+        """
+        settings = get_settings()
+        max_bytes = settings.max_download_mb * 1024 * 1024
         link = await self.get_download_link(repo_id, path)
-        resp = await self._http.get(link)
-        if resp.status_code >= 400:
-            raise SeafileAPIError(resp.status_code, _short_body(resp))
-        return resp.content
+
+        chunks: list[bytes] = []
+        total = 0
+        partial = False
+        decided = False
+
+        async with self._http.stream("GET", link) as resp:
+            # Mirrors _request: the shared client has follow_redirects=False,
+            # so a 3xx arrives here as a response and must be refused rather
+            # than chased with the download token in the URL.
+            if resp.is_redirect:
+                raise SeafileAPIError(
+                    resp.status_code,
+                    "Seafile returned a redirect; refusing to follow it with "
+                    "credentials attached.",
+                )
+            if resp.status_code >= 400:
+                await resp.aread()
+                raise SeafileAPIError(resp.status_code, _short_body(resp))
+
+            # Content-Length is the transfer's own account of its size, which
+            # beats the metadata endpoint's: it describes this response.
+            declared = _content_length(resp)
+
+            async for chunk in resp.aiter_bytes():
+                chunks.append(chunk)
+                total += len(chunk)
+
+                if not decided and total >= documents.SNIFF_BYTES:
+                    decided = True
+                    oversized = declared is not None and declared > max_bytes
+                    if oversized and documents.requires_complete_file(b"".join(chunks)):
+                        raise SafetyError(
+                            f"{normalize_path(path)} is "
+                            f"{declared / (1024 * 1024):.1f} MB, over this "
+                            f"server's {settings.max_download_mb} MB limit, and "
+                            f"its format cannot be read from part of a file — a "
+                            f"PDF or Office document needs its whole self to "
+                            f"open. Nothing was downloaded. Use "
+                            f"seafile_get_download_link to fetch it directly."
+                        )
+
+                if total > max_bytes:
+                    # Strictly greater, deliberately: reaching the cap exactly
+                    # means the file ends there, not that there is more after
+                    # it. With >=, a file of precisely max_download_mb was
+                    # flagged partial although it had downloaded whole — which
+                    # refused a complete PDF outright and told a text caller
+                    # there was content this server could not reach when there
+                    # was none. The cost is buffering one chunk past the cap
+                    # before slicing, which is bounded by the chunk size.
+                    partial = True
+                    break
+
+        data = b"".join(chunks)[:max_bytes]
+
+        # The size may have been unknown or wrong, so the same decision has to
+        # hold once the cap has actually been reached.
+        if partial and documents.requires_complete_file(data):
+            raise SafetyError(
+                f"{normalize_path(path)} is larger than this server's "
+                f"{settings.max_download_mb} MB limit, and its format cannot be "
+                f"read from part of a file — a PDF or Office document needs its "
+                f"whole self to open. Use seafile_get_download_link to fetch it "
+                f"directly."
+            )
+
+        # Not `declared or None`: a genuinely empty file declares 0, and that
+        # is a size, not a missing one. _content_length already returns None
+        # when the header is absent or unparseable.
+        return Download(data=data, partial=partial, total_size=declared)
 
     # ------------------------------------------------------------------ #
     # writing
@@ -477,6 +567,18 @@ class SeafileClient:
                     # Far past any threshold we would accept; stop walking.
                     return total, True
         return total, True
+
+
+def _content_length(resp: httpx.Response) -> int | None:
+    """The response's declared body size, if it declared one honestly."""
+    raw = resp.headers.get("content-length")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
 
 
 def _short_body(resp: httpx.Response) -> str:

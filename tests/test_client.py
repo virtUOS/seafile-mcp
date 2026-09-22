@@ -7,8 +7,10 @@ import pytest
 import respx
 
 from seafile_mcp.client import SeafileClient, normalize_path
+from seafile_mcp.config import get_settings
 from seafile_mcp.models import (
     Credentials,
+    SafetyError,
     SeafileAPIError,
     SeafileMCPError,
     TokenMode,
@@ -316,3 +318,227 @@ async def test_api_errors_surface_the_status():
         with pytest.raises(SeafileAPIError) as exc:
             await SeafileClient(ACCOUNT).list_libraries()
     assert exc.value.status == 403
+
+
+# --------------------------------------------------------------------------- #
+# Download cap
+# --------------------------------------------------------------------------- #
+
+
+def _cap_at_1mb(monkeypatch):
+    monkeypatch.setenv("SEAFILE_MCP_MAX_DOWNLOAD_MB", "1")
+    get_settings.cache_clear()
+
+
+def _mock_download(body: bytes):
+    respx.get(f"{SERVER}/api2/repos/r1/file/").mock(
+        return_value=httpx.Response(200, json=f"{SERVER}/f/abc/")
+    )
+    return respx.get(f"{SERVER}/f/abc/").mock(
+        return_value=httpx.Response(200, content=body)
+    )
+
+
+async def test_a_file_within_the_cap_comes_back_whole():
+    with respx.mock:
+        _mock_download(b"hello")
+        got = await SeafileClient(ACCOUNT).read_file_bytes("r1", "/a.txt")
+    assert got.data == b"hello"
+    assert got.partial is False
+
+
+async def test_an_oversized_text_file_comes_back_as_a_prefix(monkeypatch):
+    """The first N bytes of a log or Markdown file are exactly the first N
+    bytes of its text, so refusing it outright would be pure loss."""
+    _cap_at_1mb(monkeypatch)
+    body = b"a" * (3 * 1024 * 1024)
+
+    with respx.mock:
+        _mock_download(body)
+        got = await SeafileClient(ACCOUNT).read_file_bytes("r1", "/big.log")
+
+    assert got.partial is True
+    assert len(got.data) == 1024 * 1024
+    assert got.data == body[: 1024 * 1024]
+    assert got.total_size == len(body)
+
+
+async def test_an_oversized_pdf_is_refused_before_the_whole_transfer(monkeypatch):
+    """A PDF's xref table is at the end, so a prefix cannot be opened. Bailing
+    on the declared size means a 2 GB file costs one chunk, not the full cap."""
+    _cap_at_1mb(monkeypatch)
+    body = b"%PDF-1.7" + b"\x00" * (3 * 1024 * 1024)
+
+    with respx.mock:
+        _mock_download(body)
+        with pytest.raises(SafetyError, match="cannot be read from part of a file"):
+            await SeafileClient(ACCOUNT).read_file_bytes("r1", "/big.pdf")
+
+
+async def test_an_oversized_ooxml_file_is_refused(monkeypatch):
+    """.docx/.xlsx/.pptx are ZIPs, and the central directory is at the end."""
+    _cap_at_1mb(monkeypatch)
+    body = b"PK\x03\x04" + b"\x00" * (3 * 1024 * 1024)
+
+    with respx.mock:
+        _mock_download(body)
+        with pytest.raises(SafetyError, match="cannot be read from part of a file"):
+            await SeafileClient(ACCOUNT).read_file_bytes("r1", "/big.docx")
+
+
+async def test_an_oversized_pdf_with_no_declared_size_is_still_refused(monkeypatch):
+    """Chunked transfer sends no Content-Length, so the same decision has to
+    hold once the cap is actually reached."""
+    _cap_at_1mb(monkeypatch)
+
+    async def stream():
+        yield b"%PDF-1.7" + b"\x00" * 100_000
+        for _ in range(20):
+            yield b"\x00" * 100_000
+
+    with respx.mock:
+        respx.get(f"{SERVER}/api2/repos/r1/file/").mock(
+            return_value=httpx.Response(200, json=f"{SERVER}/f/abc/")
+        )
+        respx.get(f"{SERVER}/f/abc/").mock(
+            return_value=httpx.Response(200, stream=stream())
+        )
+        with pytest.raises(SafetyError, match="larger than this server"):
+            await SeafileClient(ACCOUNT).read_file_bytes("r1", "/big.pdf")
+
+
+async def test_a_small_pdf_is_not_refused(monkeypatch):
+    """The format check must only fire alongside the size limit."""
+    _cap_at_1mb(monkeypatch)
+    body = b"%PDF-1.7 tiny"
+
+    with respx.mock:
+        _mock_download(body)
+        got = await SeafileClient(ACCOUNT).read_file_bytes("r1", "/small.pdf")
+
+    assert got.data == body
+    assert got.partial is False
+
+
+async def test_an_oversized_pdf_with_no_declared_size_is_refused_after_download(monkeypatch):
+    """When Content-Length is absent (chunked transfer), the same safety decision
+    must hold once we've actually received the data. A PDF prefix cannot be opened,
+    so we should raise even though partial=False because the loop ended naturally."""
+    _cap_at_1mb(monkeypatch)
+
+    async def stream():
+        # Send just over 1 MB of PDF data, but no Content-Length
+        yield b"%PDF-1.7" + b"\x00" * 100_000
+        for _ in range(20):
+            yield b"\x00" * 100_000  # Total: ~2 MB
+
+    with respx.mock:
+        respx.get(f"{SERVER}/api2/repos/r1/file/").mock(
+            return_value=httpx.Response(200, json=f"{SERVER}/f/abc/")
+        )
+        respx.get(f"{SERVER}/f/abc/").mock(
+            return_value=httpx.Response(200, stream=stream())
+        )
+        with pytest.raises(SafetyError, match="larger than this server"):
+            await SeafileClient(ACCOUNT).read_file_bytes("r1", "/big.pdf")
+async def test_a_redirect_on_the_download_is_refused():
+    """The streaming rewrite must not quietly regain follow_redirects."""
+    with respx.mock:
+        respx.get(f"{SERVER}/api2/repos/r1/file/").mock(
+            return_value=httpx.Response(200, json=f"{SERVER}/f/abc/")
+        )
+        respx.get(f"{SERVER}/f/abc/").mock(
+            return_value=httpx.Response(302, headers={"Location": "https://evil.example/"})
+        )
+        with pytest.raises(SeafileAPIError, match="refusing to follow"):
+            await SeafileClient(ACCOUNT).read_file_bytes("r1", "/a.txt")
+
+
+async def test_an_error_on_the_download_is_reported():
+    with respx.mock:
+        respx.get(f"{SERVER}/api2/repos/r1/file/").mock(
+            return_value=httpx.Response(200, json=f"{SERVER}/f/abc/")
+        )
+        respx.get(f"{SERVER}/f/abc/").mock(
+            return_value=httpx.Response(404, text="gone")
+        )
+        with pytest.raises(SeafileAPIError, match="404"):
+            await SeafileClient(ACCOUNT).read_file_bytes("r1", "/a.txt")
+
+
+# --------------------------------------------------------------------------- #
+# The cap boundary
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_file_of_exactly_the_cap_is_not_partial(monkeypatch):
+    """Reaching the cap means the file ends there, not that more follows.
+
+    With `total >= max_bytes` this was flagged partial although the download
+    had completed, which told the caller there was content the server could
+    not reach when there was none.
+    """
+    _cap_at_1mb(monkeypatch)
+    body = b"a" * (1024 * 1024)
+
+    with respx.mock:
+        _mock_download(body)
+        got = await SeafileClient(ACCOUNT).read_file_bytes("r1", "/exact.txt")
+
+    assert got.partial is False
+    assert got.data == body
+
+
+async def test_a_pdf_of_exactly_the_cap_is_returned_not_refused(monkeypatch):
+    """Same boundary, sharper consequence: a complete PDF was being refused."""
+    _cap_at_1mb(monkeypatch)
+    body = b"%PDF-1.7" + b"\x00" * (1024 * 1024 - 8)
+    assert len(body) == 1024 * 1024
+
+    with respx.mock:
+        _mock_download(body)
+        got = await SeafileClient(ACCOUNT).read_file_bytes("r1", "/exact.pdf")
+
+    assert got.partial is False
+    assert got.data == body
+
+
+async def test_one_byte_over_the_cap_is_partial(monkeypatch):
+    """The other side of the boundary still has to behave."""
+    _cap_at_1mb(monkeypatch)
+    body = b"a" * (1024 * 1024 + 1)
+
+    with respx.mock:
+        _mock_download(body)
+        got = await SeafileClient(ACCOUNT).read_file_bytes("r1", "/over.txt")
+
+    assert got.partial is True
+    assert len(got.data) == 1024 * 1024
+
+
+async def test_a_declared_size_of_zero_is_a_size_not_a_missing_one():
+    """`declared or None` turned a real 0 into "size unknown".
+
+    The Content-Length is set explicitly here: httpx omits the header entirely
+    for an empty body, which would exercise the absent case rather than this
+    one.
+    """
+    with respx.mock:
+        respx.get(f"{SERVER}/api2/repos/r1/file/").mock(
+            return_value=httpx.Response(200, json=f"{SERVER}/f/abc/")
+        )
+        respx.get(f"{SERVER}/f/abc/").mock(
+            return_value=httpx.Response(200, content=b"", headers={"content-length": "0"})
+        )
+        got = await SeafileClient(ACCOUNT).read_file_bytes("r1", "/empty.txt")
+
+    assert got.data == b""
+    assert got.partial is False
+    assert got.total_size == 0
+
+
+async def test_a_missing_content_length_reports_no_size():
+    with respx.mock:
+        _mock_download(b"hello")
+        got = await SeafileClient(ACCOUNT).read_file_bytes("r1", "/a.txt")
+    assert got.data == b"hello"

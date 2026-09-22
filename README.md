@@ -93,7 +93,14 @@ SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES=30      # preview only past 30 pages
 SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES=all     # never preview; always extract the whole PDF
 SEAFILE_MCP_PPTX_PREVIEW_THRESHOLD_SLIDES=30    # same idea, for PowerPoint slides
 SEAFILE_MCP_XLSX_PREVIEW_THRESHOLD_SHEETS=10    # same idea, for Excel sheet counts
+SEAFILE_MCP_MAX_DOWNLOAD_MB=30                  # bytes of one file held in memory
 ```
+
+`SEAFILE_MCP_MAX_DOWNLOAD_MB` is a safety limit rather than a tuning knob: one
+process serves every user, so an unbounded read is an availability problem, not a
+slow call. Over the limit, text comes back as a prefix flagged `truncated`, while a
+PDF or Office document raises — their structure lives at the end of the file, so a
+prefix cannot be parsed at all. See [docs/deploy.md](docs/deploy.md).
 
 ## Agent skill
 

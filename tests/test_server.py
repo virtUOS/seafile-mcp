@@ -8,6 +8,8 @@ import httpx
 import pytest
 import respx
 
+from fastmcp.exceptions import ToolError
+
 from seafile_mcp import auth
 from seafile_mcp.config import Mode, Settings, get_settings
 from seafile_mcp.server import build_server
@@ -426,3 +428,34 @@ async def test_legacy_or_encrypted_office_file_raises_clear_error(monkeypatch):
         _mock_file_download(CFB_MAGIC_BYTES)
         with pytest.raises(ToolError, match="password-protected"):
             await tool.fn(path="/old.doc", repo_id="r1")
+
+
+# --------------------------------------------------------------------------- #
+# Download cap, end to end
+# --------------------------------------------------------------------------- #
+
+
+async def test_an_oversized_text_file_reads_as_a_prefix(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+    monkeypatch.setenv("SEAFILE_MCP_MAX_DOWNLOAD_MB", "1")
+    get_settings.cache_clear()
+
+    with respx.mock:
+        _mock_file_download(b"log line\n" * 300_000)
+        result = await tool.fn(path="/huge.log", repo_id="r1")
+
+    assert result.truncated is True
+    assert result.content.startswith("log line")
+    assert "only its first 1 MB were downloaded" in result.notice
+    assert "seafile_get_download_link" in result.notice
+
+
+async def test_an_oversized_pdf_reports_why_it_cannot_be_read(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+    monkeypatch.setenv("SEAFILE_MCP_MAX_DOWNLOAD_MB", "1")
+    get_settings.cache_clear()
+
+    with respx.mock:
+        _mock_file_download(b"%PDF-1.7" + b"\x00" * (3 * 1024 * 1024))
+        with pytest.raises(ToolError, match="cannot be read from part of a file"):
+            await tool.fn(path="/huge.pdf", repo_id="r1")

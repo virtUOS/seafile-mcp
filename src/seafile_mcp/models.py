@@ -87,6 +87,21 @@ class SafetyError(SeafileMCPError):
 # --------------------------------------------------------------------------- #
 
 
+class Download(BaseModel):
+    """Raw bytes fetched for a file, and whether they are all of it.
+
+    ``partial`` is True when the download stopped at the server's size limit.
+    Only formats that can be read from a prefix ever come back partial; the
+    ones that cannot raise instead of returning something unparseable.
+    """
+
+    data: bytes = Field(repr=False)
+    partial: bool = False
+    total_size: int | None = Field(
+        default=None, description="The file's full size, when the transfer declared one."
+    )
+
+
 class LibraryInfo(BaseModel):
     id: str
     name: str

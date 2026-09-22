@@ -14,6 +14,14 @@ services:
       SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES: ${SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES:-15}
       SEAFILE_MCP_PPTX_PREVIEW_THRESHOLD_SLIDES: ${SEAFILE_MCP_PPTX_PREVIEW_THRESHOLD_SLIDES:-20}
       SEAFILE_MCP_XLSX_PREVIEW_THRESHOLD_SHEETS: ${SEAFILE_MCP_XLSX_PREVIEW_THRESHOLD_SHEETS:-5}
+      # Size limits. max_file_read_kb caps the *text* a caller gets back;
+      # max_download_mb caps the bytes held in memory to produce it, which is a
+      # separate concern with a wider blast radius since one process serves
+      # every user.
+      SEAFILE_MCP_MAX_FILE_READ_KB: ${SEAFILE_MCP_MAX_FILE_READ_KB:-512}
+      SEAFILE_MCP_MAX_DOWNLOAD_MB: ${SEAFILE_MCP_MAX_DOWNLOAD_MB:-30}
+      SEAFILE_MCP_MUTATION_RATE_LIMIT: ${SEAFILE_MCP_MUTATION_RATE_LIMIT:-30}
+      SEAFILE_MCP_REQUEST_TIMEOUT_S: ${SEAFILE_MCP_REQUEST_TIMEOUT_S:-30}
     # No `ports:` — the only way in is through Caddy.
     networks: [internal]
 

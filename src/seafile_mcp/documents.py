@@ -557,6 +557,36 @@ def sheet_notice(x: XlsxExtract) -> str:
 _CFB_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
+#: How many leading bytes are enough to recognise a container format.
+SNIFF_BYTES = 1024
+
+#: Magic numbers for formats whose index lives at the *end* of the file, so a
+#: prefix of one cannot be parsed at all: a PDF's cross-reference table, and the
+#: ZIP central directory that .docx/.xlsx/.pptx depend on. OLE2 (legacy binary
+#: Office, and password-protected OOXML) is in the same position.
+_ZIP_MAGIC = b"PK\x03\x04"
+
+
+def requires_complete_file(head: bytes) -> bool:
+    """True if this format cannot be read from a prefix of its bytes.
+
+    Used to decide whether a file too large for the download cap can still be
+    served partially. Plain text can: the first N bytes of a log or Markdown
+    file are exactly the first N bytes of its text. A PDF or an OOXML document
+    cannot, because the structure needed to find anything sits at the end, so
+    handing back a prefix would produce a parse error rather than partial
+    content.
+
+    Deliberately magic-number only: this runs on whatever has arrived so far,
+    which is far too little for ``is_docx`` and friends to open the archive.
+    """
+    return (
+        b"%PDF-" in head[:SNIFF_BYTES]
+        or head[:4] == _ZIP_MAGIC
+        or head[:8] == _CFB_MAGIC
+    )
+
+
 def is_legacy_or_encrypted_office(data: bytes) -> bool:
     """True if the bytes are an OLE2/CFB container.
 
@@ -569,6 +599,8 @@ def is_legacy_or_encrypted_office(data: bytes) -> bool:
 
 
 __all__ = [
+    "requires_complete_file",
+    "SNIFF_BYTES",
     "is_pdf",
     "is_docx",
     "is_pptx",

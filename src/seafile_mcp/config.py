@@ -99,6 +99,19 @@ class Settings(BaseSettings):
     max_file_read_kb: int = 512
     max_delete_items: int = 50
 
+    #: Hard ceiling on how many bytes of one file this server will hold in
+    #: memory. Distinct from max_file_read_kb, which caps how much *text* comes
+    #: back and says nothing about the size of the file behind it: before this
+    #: existed, a 2 GB file was downloaded in full and then sliced to 512 KB.
+    #: One process serves every user, so this is a safety limit rather than a
+    #: tuning knob.
+    #:
+    #: A file over the limit is not simply refused. Text is returned as a
+    #: prefix, flagged truncated; only formats that cannot be parsed from a
+    #: prefix at all (PDF, .docx/.xlsx/.pptx) raise, because handing back part
+    #: of one produces a parse error rather than partial content.
+    max_download_mb: int = 30
+
     #: A bare seafile_read_file call on a PDF longer than this extracts only
     #: a short preview instead of the whole document (see documents.py). Set
     #: to "all" to always extract the whole document regardless of length.

@@ -237,7 +237,8 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
             start_slide, end_slide, start_name="start_slide", end_name="end_slide"
         )
         client, _ = await _connect()
-        raw = await client.read_file_bytes(repo_id, path)
+        download = await client.read_file_bytes(repo_id, path)
+        raw = download.data
         settings = get_settings()
         cap = settings.max_file_read_kb * 1024
         param_values: dict[str, Any] = {
@@ -338,6 +339,32 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
             truncated = len(raw) > cap
             content = raw[:cap].decode("utf-8", errors="replace")
             notice = UNTRUSTED_NOTICE
+
+        if download.partial:
+            # Applies to whatever branch ran, not just the plain-text one. In
+            # practice only text can get here — read_file_bytes raises on a
+            # short download of any format that needs its whole file — but that
+            # depends on requires_complete_file's magic numbers covering every
+            # format the chain above handles, which is not something this spot
+            # can see. Keeping it out here means a format added later cannot
+            # quietly return a prefix with no explanation of why.
+            #
+            # Note there are two independent cuts: the download stopped at
+            # max_download_mb, and the text was then capped at
+            # max_file_read_kb. Only the first means there is content this
+            # server cannot reach at all, so it says so explicitly.
+            size = (
+                f" of roughly {download.total_size / (1024 * 1024):.0f} MB"
+                if download.total_size
+                else ""
+            )
+            truncated = True
+            notice += (
+                f" This file{size} is larger than this server will hold in "
+                f"memory, so only its first {settings.max_download_mb} MB were "
+                f"downloaded and what you see is the start of it. Use "
+                f"seafile_get_download_link if you need the rest."
+            )
 
         return FileContent(
             path=normalize_path(path),
