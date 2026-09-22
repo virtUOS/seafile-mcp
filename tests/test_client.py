@@ -18,6 +18,7 @@ from seafile_mcp.models import (
 )
 
 from .conftest import SERVER
+from .conftest import image_bytes as _image_bytes
 
 ACCOUNT = Credentials(token="acct", mode=TokenMode.account)
 REPO = Credentials(token="repo", mode=TokenMode.repo)
@@ -542,3 +543,67 @@ async def test_a_missing_content_length_reports_no_size():
         _mock_download(b"hello")
         got = await SeafileClient(ACCOUNT).read_file_bytes("r1", "/a.txt")
     assert got.data == b"hello"
+
+
+async def test_an_oversized_image_is_refused_before_the_whole_transfer(monkeypatch):
+    """A prefix of a PNG is not a smaller picture, it is an undecodable
+    fragment — and a decoder that does limp through one hands a vision model a
+    half-grey image it will describe with confidence. A wrong answer, not a
+    partial one."""
+    _cap_at_1mb(monkeypatch)
+    body = _image_bytes(8, 8, "PNG") + b"\x00" * (3 * 1024 * 1024)
+
+    with respx.mock:
+        _mock_download(body)
+        with pytest.raises(SafetyError, match="cannot be read from part of a file"):
+            await SeafileClient(ACCOUNT).read_file_bytes("r1", "/big.png")
+
+
+async def test_an_oversized_image_with_no_declared_size_is_refused(monkeypatch):
+    """The chunked-transfer path, where the decision has to hold again once the
+    cap is actually reached."""
+    _cap_at_1mb(monkeypatch)
+    head = _image_bytes(8, 8, "JPEG")
+
+    async def stream():
+        yield head + b"\x00" * 100_000
+        for _ in range(20):
+            yield b"\x00" * 100_000
+
+    with respx.mock:
+        respx.get(f"{SERVER}/api2/repos/r1/file/").mock(
+            return_value=httpx.Response(200, json=f"{SERVER}/f/abc/")
+        )
+        respx.get(f"{SERVER}/f/abc/").mock(
+            return_value=httpx.Response(200, stream=stream())
+        )
+        with pytest.raises(SafetyError, match="larger than this server"):
+            await SeafileClient(ACCOUNT).read_file_bytes("r1", "/big.jpg")
+
+
+async def test_an_image_within_the_cap_is_not_refused(monkeypatch):
+    """The format check only fires alongside the size limit."""
+    _cap_at_1mb(monkeypatch)
+    body = _image_bytes(40, 30, "PNG")
+
+    with respx.mock:
+        _mock_download(body)
+        got = await SeafileClient(ACCOUNT).read_file_bytes("r1", "/small.png")
+
+    assert got.partial is False
+    assert got.data == body
+
+
+async def test_an_oversized_text_file_starting_with_bm_is_still_a_prefix(monkeypatch):
+    """The BMP false-positive guard, at the layer where it actually costs
+    something: "BM" alone would make this text file get refused instead of
+    returned."""
+    _cap_at_1mb(monkeypatch)
+    body = b"BMW and other marques, discussed at length. " * 80_000
+
+    with respx.mock:
+        _mock_download(body)
+        got = await SeafileClient(ACCOUNT).read_file_bytes("r1", "/cars.txt")
+
+    assert got.partial is True
+    assert got.data == body[: 1024 * 1024]

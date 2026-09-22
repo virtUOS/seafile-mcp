@@ -9,6 +9,13 @@ rather than trusted from the caller-supplied filename. There is no OCR: any
 format's scanned/image-only or otherwise textless content comes back as an
 explicit placeholder, never silent garbage.
 
+Image files are the one format here that does not become text at all. They are
+decoded, downscaled and re-encoded by ``render_image`` so the tool can hand the
+model the picture itself as an MCP image block — the only way an agent with no
+sandbox and no filesystem can see one. Before this existed a .png fell through
+to the plain-text path and came back as half a megabyte of U+FFFD, which is the
+exact failure this module was written to stop.
+
 PDF pages and PowerPoint slides are read in pieces rather than parsed
 cover-to-cover on every call, since extracting a unit's text is the
 expensive step and a bare call auto-previews the first few units of a long
@@ -34,6 +41,8 @@ from typing import NamedTuple
 
 import openpyxl
 from docx import Document as DocxDocument
+from PIL import Image as PILImage
+from PIL import ImageOps
 from pptx import Presentation
 from pypdf import PdfReader
 
@@ -547,6 +556,333 @@ def sheet_notice(x: XlsxExtract) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Images
+# --------------------------------------------------------------------------- #
+
+#: Default for Settings.max_image_edge_px. Mainstream vision models downsample
+#: anything whose long edge is bigger than roughly this before they look at it,
+#: so sending more pixels costs upload bytes and the model's tool-output budget
+#: without buying any detail it can actually use.
+DEFAULT_MAX_IMAGE_EDGE_PX = 1568
+
+#: Default for Settings.max_image_mb, applied to the *re-encoded* image before
+#: base64 inflates it by a third. A tool result goes straight into a model's
+#: context, so this bounds the context cost of one call as much as the bytes.
+DEFAULT_MAX_IMAGE_MB = 5
+
+#: Ceiling on decoded pixels, checked against the header before anything is
+#: decoded. A 2 MB PNG can declare 60000x60000, which is ~14 GB as RGBA, so
+#: max_download_mb does not bound this at all: the compressed size of a
+#: decompression bomb says nothing about its decoded size. 50 MP is comfortably
+#: past any real camera (a 24 MP frame is 24 MP) and costs ~200 MB decoded,
+#: which one shared process can survive.
+MAX_IMAGE_PIXELS = 50_000_000
+
+#: Formats Pillow is permitted to identify. Without an allow-list Pillow will
+#: recognise text beginning "P3" as a PPM and "%!PS" as EPS, so a plain file
+#: could be routed into the image path by a decoder far more eager than the
+#: magic-number table below. Only formats is_image actually sniffs are listed.
+_PILLOW_FORMATS = ("PNG", "JPEG", "JPEG2000", "GIF", "BMP", "WEBP", "TIFF", "ICO")
+
+#: JPEG attempts, in order, when the encoded result is over the byte cap: a
+#: bounded ladder rather than a loop, each step cheap next to the decode.
+#: Quality stops at 60 and then the long edge halves instead, because below
+#: that the ringing starts eating the small text in a scan or a screenshot,
+#: which is usually the thing the model was asked to read.
+_JPEG_LADDER: tuple[tuple[int, int], ...] = (
+    (85, 1),
+    (72, 1),
+    (60, 1),
+    (72, 2),
+    (60, 4),
+)
+
+IMAGE_EXTRACTION_NOTICE = (
+    " This file is an image. It is attached to this result as an image you can "
+    "see directly, not as text, and no OCR was performed on it."
+)
+
+
+def _is_bmp(head: bytes) -> bool:
+    """True for a BMP header.
+
+    "BM" alone is two bytes and matches plenty of ordinary text, which matters
+    more than it looks: ``requires_complete_file`` consults ``is_image``, so a
+    false positive would make an oversized text file starting "BM" get refused
+    outright instead of returned as a readable prefix. The BMP header's two
+    reserved 16-bit fields at offsets 6-10 are zero in every real BMP, which
+    takes the false-positive rate from plausible to negligible.
+    """
+    return len(head) >= 14 and head[:2] == b"BM" and head[6:10] == b"\x00\x00\x00\x00"
+
+
+#: Magic numbers for the raster formats this server renders, as (offset, magic)
+#: pairs. Sniffed on content, never on the filename, like every other format in
+#: this module. WebP and BMP need more than a fixed pair and are checked
+#: separately in is_image.
+_IMAGE_MAGIC: tuple[tuple[int, bytes], ...] = (
+    (0, b"\x89PNG\r\n\x1a\n"),                      # PNG
+    (0, b"\xff\xd8\xff"),                           # JPEG
+    (0, b"GIF87a"),                                 # GIF
+    (0, b"GIF89a"),
+    (0, b"II\x2a\x00"),                             # TIFF, little-endian
+    (0, b"MM\x00\x2a"),                             # TIFF, big-endian
+    (0, b"\x00\x00\x01\x00"),                       # ICO
+    (0, b"\x00\x00\x00\x0cjP  \r\n\x87\n"),         # JPEG 2000
+    (0, b"\xffO\xffQ"),                             # JPEG 2000 codestream
+    (4, b"ftypavif"),                               # AVIF
+    (4, b"ftypavis"),
+    (4, b"ftypheic"),                               # HEIF/HEIC
+    (4, b"ftypheix"),
+    (4, b"ftypmif1"),
+    (4, b"ftypmsf1"),
+)
+
+
+def is_image(data: bytes) -> bool:
+    """True if the bytes are a raster image this server can render.
+
+    Checked on content, never on the filename/extension. Magic numbers only,
+    with no Pillow involved, because ``requires_complete_file`` calls this on
+    the first kilobyte of a download that has not finished arriving. Every
+    signature here fits well inside ``SNIFF_BYTES``.
+    """
+    for offset, magic in _IMAGE_MAGIC:
+        if data[offset : offset + len(magic)] == magic:
+            return True
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    return _is_bmp(data)
+
+
+class RenderedImage(NamedTuple):
+    """An image re-encoded for a model to look at.
+
+    ``data`` is raw bytes, deliberately not base64: the caller hands them to
+    ``fastmcp.utilities.types.Image``, which does the encoding. Base64-ing them
+    here would double-encode.
+
+    ``image_format`` is the MIME suffix ("jpeg"/"png"), never "jpg" — that
+    would produce the invalid type ``image/jpg``.
+
+    The source dimensions are kept alongside the sent ones so the caller can
+    tell the model what it is *not* seeing. A 4000px scan shown at 1568px may
+    have lost the fine print, and "I cannot read this label" and "this label is
+    blank" are different answers.
+    """
+
+    data: bytes
+    image_format: str
+    width: int
+    height: int
+    source_format: str
+    source_width: int
+    source_height: int
+    downscaled: bool
+    frames: int
+
+
+def _has_alpha(img: PILImage.Image) -> bool:
+    """True if an RGBA image has at least one pixel that is not fully opaque."""
+    if img.mode != "RGBA":
+        return False
+    return img.getchannel("A").getextrema()[0] < 255
+
+
+def _flatten(img: PILImage.Image) -> PILImage.Image:
+    """Reduce whatever colour mode Pillow opened to RGB, or RGBA if it matters.
+
+    These all decode fine and then fail to re-encode: JPEG cannot hold alpha,
+    a CMYK JPEG written by Pillow renders inverted in most viewers, and 16-bit
+    and bilevel modes have no JPEG representation at all. Alpha is kept only
+    when some pixel actually uses it, because keeping it forces PNG output and
+    a photograph as PNG is several times larger for no gain.
+    """
+    if img.mode == "RGB":
+        return img
+    if img.mode == "RGBA":
+        return img if _has_alpha(img) else img.convert("RGB")
+    if img.mode in ("P", "PA", "LA", "La"):
+        converted = img.convert("RGBA")
+        return converted if _has_alpha(converted) else converted.convert("RGB")
+    # L, 1, I, I;16, F, CMYK, YCbCr. The 16-bit and float modes are scientific
+    # TIFF territory and clip rather than rescale; that is lossy, and said so
+    # in the notice rather than papered over with autocontrast.
+    return img.convert("RGB")
+
+
+def _encode(img: PILImage.Image, max_bytes: int) -> tuple[bytes, str, PILImage.Image]:
+    """Encode under ``max_bytes``, returning the bytes, format, and final image.
+
+    PNG when the image has real transparency: JPEG would composite it, and
+    compositing dark text on a transparent background onto black makes a
+    screenshot unreadable. Everything else is JPEG, which is 5-15x smaller than
+    PNG for photographs and scans and is accepted everywhere.
+
+    The image comes back too because a ladder step may have resized it, and the
+    caller reports the dimensions actually sent.
+    """
+    if _has_alpha(img):
+        buf = BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        data = buf.getvalue()
+        if len(data) <= max_bytes:
+            return data, "png", img
+        # Too big with transparency intact. Compositing onto white loses less
+        # than refusing, and image_notice says it happened.
+        flat = PILImage.new("RGB", img.size, (255, 255, 255))
+        flat.paste(img, mask=img.getchannel("A"))
+        img = flat
+
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    data = b""
+    candidate = img
+    for quality, divisor in _JPEG_LADDER:
+        candidate = img
+        if divisor > 1:
+            candidate = img.copy()
+            candidate.thumbnail(
+                (max(img.width // divisor, 1), max(img.height // divisor, 1)),
+                PILImage.Resampling.LANCZOS,
+            )
+        buf = BytesIO()
+        candidate.save(buf, format="JPEG", quality=quality, optimize=True)
+        data = buf.getvalue()
+        if len(data) <= max_bytes:
+            break
+    return data, "jpeg", candidate
+
+
+def render_image(
+    data: bytes,
+    max_edge: int = DEFAULT_MAX_IMAGE_EDGE_PX,
+    max_bytes: int = DEFAULT_MAX_IMAGE_MB * 1024 * 1024,
+) -> RenderedImage:
+    """Decode, downscale and re-encode an image so a model can look at it.
+
+    Raises ValueError on anything that cannot be decoded, rather than returning
+    something broken — the same contract as every other extractor here, and
+    what lets ``_handle_errors`` turn it into a clean ToolError.
+
+    Blocking and CPU-bound, so callers run it in a worker thread: decoding a
+    24 MP JPEG is a few hundred milliseconds of C, and one process serves every
+    user of this deployment. Pillow releases the GIL in decode and resize, so a
+    thread genuinely helps here.
+
+    The order of operations is load-bearing:
+
+    1. identify from the header only — ``PILImage.open`` is lazy, so the size
+       is known before any buffer is allocated and a bomb is refused for free;
+    2. ``draft`` lets libjpeg DCT-scale during decode, so a 24 MP photo never
+       materialises at full size just to be shrunk afterwards;
+    3. EXIF orientation, because phones record the sensor's rotation rather
+       than the photo's and an upright scan decoded sideways is unreadable;
+    4. colour mode flattened (see ``_flatten``);
+    5. downscaled to ``max_edge`` on the long side, never enlarged — upscaling
+       adds bytes and invents no detail.
+    """
+    try:
+        img = PILImage.open(BytesIO(data), formats=_PILLOW_FORMATS)
+    except PILImage.DecompressionBombError as exc:
+        # Pillow's own global ceiling, which it applies while parsing the
+        # header. Caught separately so the caller gets the size explanation
+        # rather than a generic "could not be decoded".
+        raise ValueError(
+            f"This image declares more pixels than this server will decode "
+            f"({exc}). Use seafile_get_download_link to fetch it directly."
+        ) from None
+    except Exception as exc:
+        raise ValueError(
+            f"This file looks like an image but could not be decoded: {exc}"
+        ) from None
+
+    source_format = img.format or "unknown"
+    # The header's dimensions, which are what the bomb check must use — it has
+    # to run before anything is decoded. They are the *stored* raster, so for an
+    # EXIF-rotated photo the axes are swapped relative to how it is meant to be
+    # seen; the reported source size is taken again after exif_transpose below,
+    # since the caller quotes it to the model and "3000x4000" for a picture the
+    # model is looking at in landscape is just wrong.
+    header_width, header_height = img.size
+    frames = getattr(img, "n_frames", 1)
+
+    # Checked against the header, before a pixel is decoded. Not done by
+    # raising PILImage.MAX_IMAGE_PIXELS: that global is shared with python-pptx
+    # in this same process, and mutating it from a worker thread would let two
+    # concurrent reads restore each other's value.
+    if header_width * header_height > MAX_IMAGE_PIXELS:
+        raise ValueError(
+            f"This image is {header_width}x{header_height} "
+            f"({header_width * header_height / 1e6:.0f} megapixels), past what "
+            f"this server will decode. Use seafile_get_download_link to fetch "
+            f"it directly."
+        )
+
+    # JPEG/JPEG2000 only, ignored by every other format. Must precede load().
+    img.draft(None, (max_edge, max_edge))
+
+    try:
+        img = ImageOps.exif_transpose(img) or img
+        source_width, source_height = img.size
+        img = _flatten(img)
+    except PILImage.DecompressionBombError as exc:
+        # Backstop: Pillow's own global guard, for a format that reports its
+        # size only once decoding starts.
+        raise ValueError(f"Refused to decode this image: {exc}") from None
+    except Exception as exc:
+        raise ValueError(
+            f"This file looks like an image but could not be decoded: {exc}"
+        ) from None
+
+    downscaled = max(img.size) > max_edge
+    if downscaled:
+        img.thumbnail((max_edge, max_edge), PILImage.Resampling.LANCZOS)
+
+    encoded, image_format, final = _encode(img, max_bytes)
+
+    return RenderedImage(
+        data=encoded,
+        image_format=image_format,
+        width=final.width,
+        height=final.height,
+        source_format=source_format,
+        source_width=source_width,
+        source_height=source_height,
+        downscaled=downscaled or final.size != img.size,
+        frames=frames,
+    )
+
+
+def image_notice(path: str, x: RenderedImage) -> str:
+    """State what the model is looking at, and what it is not.
+
+    Says explicitly when the image was shrunk, because "I cannot read the
+    serial number in this photo" and "this photo has no serial number" are
+    different answers and only this server knows which one applies.
+    """
+    parts = [
+        f" {path} is a {x.source_format} image, "
+        f"{x.source_width}x{x.source_height} pixels."
+    ]
+    if x.downscaled:
+        parts.append(
+            f" It was downscaled to {x.width}x{x.height} to fit this server's "
+            f"limits, so small print in it may be illegible or misread — say so "
+            f"rather than guessing at it."
+        )
+    else:
+        parts.append(" It is shown at full size.")
+    if x.frames > 1:
+        parts.append(
+            f" The source is animated with {x.frames} frames; only the first "
+            f"is shown."
+        )
+    return "".join(parts)
+
+
+# --------------------------------------------------------------------------- #
 # Legacy binary / encrypted Office files (.doc/.xls/.ppt or password-protected)
 # --------------------------------------------------------------------------- #
 
@@ -577,6 +913,10 @@ def requires_complete_file(head: bytes) -> bool:
     handing back a prefix would produce a parse error rather than partial
     content.
 
+    Images are in the same position for a different reason: a prefix of a PNG
+    or JPEG is not a smaller picture, it is an undecodable fragment, and half
+    an image is of no more use to a model than half a PDF.
+
     Deliberately magic-number only: this runs on whatever has arrived so far,
     which is far too little for ``is_docx`` and friends to open the archive.
     """
@@ -584,6 +924,7 @@ def requires_complete_file(head: bytes) -> bool:
         b"%PDF-" in head[:SNIFF_BYTES]
         or head[:4] == _ZIP_MAGIC
         or head[:8] == _CFB_MAGIC
+        or is_image(head)
     )
 
 
@@ -606,6 +947,10 @@ __all__ = [
     "is_pptx",
     "is_xlsx",
     "is_legacy_or_encrypted_office",
+    "is_image",
+    "RenderedImage",
+    "render_image",
+    "image_notice",
     "check_page_range",
     "PdfExtract",
     "extract_pdf_text",
@@ -624,4 +969,8 @@ __all__ = [
     "DEFAULT_PDF_PREVIEW_THRESHOLD_PAGES",
     "DEFAULT_PPTX_PREVIEW_THRESHOLD_SLIDES",
     "DEFAULT_XLSX_PREVIEW_THRESHOLD_SHEETS",
+    "IMAGE_EXTRACTION_NOTICE",
+    "DEFAULT_MAX_IMAGE_EDGE_PX",
+    "DEFAULT_MAX_IMAGE_MB",
+    "MAX_IMAGE_PIXELS",
 ]

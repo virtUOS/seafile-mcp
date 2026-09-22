@@ -15,6 +15,8 @@ from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .documents import (
+    DEFAULT_MAX_IMAGE_EDGE_PX,
+    DEFAULT_MAX_IMAGE_MB,
     DEFAULT_PDF_PREVIEW_THRESHOLD_PAGES,
     DEFAULT_PPTX_PREVIEW_THRESHOLD_SLIDES,
     DEFAULT_XLSX_PREVIEW_THRESHOLD_SHEETS,
@@ -125,6 +127,30 @@ class Settings(BaseSettings):
     #: always extract every sheet regardless of count.
     xlsx_preview_threshold_sheets: int | None = DEFAULT_XLSX_PREVIEW_THRESHOLD_SHEETS
 
+    #: Long edge, in pixels, an image is scaled down to before it is sent as an
+    #: image content block. Mainstream vision models downsample anything larger
+    #: than roughly this themselves, so sending more costs upload bytes and the
+    #: model's tool-output budget without buying detail it can use. A smaller
+    #: image is never enlarged to meet it.
+    max_image_edge_px: int = DEFAULT_MAX_IMAGE_EDGE_PX
+
+    #: Ceiling on the re-encoded image, before base64 inflates it by a third.
+    #: Over it, render_image lowers JPEG quality and then the long edge until it
+    #: fits, so this is a guarantee rather than a hope. Distinct from
+    #: max_download_mb, which bounds what this server holds: this one bounds
+    #: what lands in the model's context, since a tool result goes straight
+    #: there.
+    max_image_mb: int = DEFAULT_MAX_IMAGE_MB
+
+    #: Whether seafile_read_file may answer with an image content block at all.
+    #: Turned off, an image comes back as an ordinary FileContent naming its
+    #: format and dimensions and pointing at seafile_get_download_link. That is
+    #: the better answer for a deployment whose client cannot render image
+    #: blocks, or whose model has no vision: the alternative is a block the host
+    #: silently drops, leaving the model with a notice about an image it cannot
+    #: see and no way to tell that is what happened.
+    image_reads: bool = True
+
     #: If set, account-mode users outside these domains are rejected.
     #: NoDecode: this is a plain comma-separated list, not JSON.
     allowed_email_domains: Annotated[tuple[str, ...], NoDecode] = ()
@@ -171,6 +197,17 @@ class Settings(BaseSettings):
     @classmethod
     def _validate_preview_threshold(cls, v: int | None, info: ValidationInfo) -> int | None:
         return _require_positive_or_none(v, f"SEAFILE_MCP_{info.field_name.upper()}")
+
+    @field_validator("max_image_edge_px", "max_image_mb")
+    @classmethod
+    def _validate_image_limit(cls, v: int, info: ValidationInfo) -> int:
+        # Deliberately not folded into _require_positive_or_none: that one's
+        # message offers "all" as an alternative, which is meaningless here.
+        if v < 1:
+            raise ValueError(
+                f"SEAFILE_MCP_{info.field_name.upper()} must be a positive integer"
+            )
+        return v
 
     def allows(self, tool_name: str) -> bool:
         """True if `tool_name` should be registered under the active mode."""

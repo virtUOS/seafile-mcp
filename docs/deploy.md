@@ -88,6 +88,48 @@ A file over the limit is not simply refused:
   so a prefix cannot be opened at all and returning one would only produce a parse
   error later. The format is recognised from the first kilobyte, so an oversized
   PDF is abandoned after one chunk rather than after a full 30 MB.
+- **Images** raise for a related reason: a prefix of a PNG or JPEG is not a smaller
+  picture, it is an undecodable fragment — and a decoder lenient enough to limp
+  through one hands a vision model a half-grey image it will then describe with
+  confidence. That is a wrong answer, not a partial one.
+
+## Images
+
+`seafile_read_file` returns an image file as an MCP image block rather than as text,
+which is the only way an agent with no sandbox can see one. Two limits bound it:
+
+```bash
+SEAFILE_MCP_MAX_IMAGE_EDGE_PX=1568   # long edge the image is scaled down to
+SEAFILE_MCP_MAX_IMAGE_MB=5           # ceiling on the re-encoded image
+```
+
+These are **context-budget knobs, not bandwidth knobs**. A tool result goes straight
+into the model's context window, and base64 inflates the bytes by a third, so one
+unbounded image read could consume a whole context. 1568 px is roughly where
+mainstream vision models downsample anyway, so raising it usually costs tokens
+without buying detail.
+
+Images are re-encoded, never passed through: oriented per EXIF (phone photos are
+stored rotated), flattened to RGB, and written as JPEG — or PNG where transparency
+would otherwise be composited away, which is what makes dark-text screenshots
+unreadable. Only the first frame of an animation is sent, and the notice says so.
+An image declaring more than 50 megapixels is refused before it is decoded: the
+compressed size of a decompression bomb says nothing about its decoded size, so
+`MAX_DOWNLOAD_MB` does not bound it.
+
+If your client cannot render image blocks, or your model has no vision, turn it off:
+
+```bash
+SEAFILE_MCP_IMAGE_READS=false
+```
+
+An image then comes back as an ordinary text result naming its format and dimensions
+and pointing at `seafile_get_download_link` — a worse answer than the picture, but a
+much better one than a block the host silently drops, which leaves the model holding
+a notice about an image it cannot see and no way to tell that is what happened.
+
+**Verify this against your own client before relying on it.** Image-block support
+varies, and this server cannot detect what the host does with what it sends.
 
 ## Search
 

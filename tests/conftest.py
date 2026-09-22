@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from io import BytesIO
 
 import pytest
@@ -98,6 +99,98 @@ def xlsx_with_sheets(sheets: dict[str, list[list[object]]]) -> bytes:
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def image_bytes(
+    width: int = 40,
+    height: int = 30,
+    fmt: str = "PNG",
+    *,
+    mode: str = "RGB",
+    noise: bool = False,
+) -> bytes:
+    """Build a real image of the given size and format.
+
+    Used by test_documents.py (unit tests on is_image/render_image) and by
+    test_server.py and test_client.py end-to-end. `noise` fills the image with
+    random pixels, which defeats every compressor — the only way to build a
+    source that actually exercises the byte-cap ladder at a small size.
+    """
+    from PIL import Image as PILImage
+
+    if noise:
+        img = PILImage.frombytes(
+            "RGB", (width, height), os.urandom(width * height * 3)
+        )
+    else:
+        img = PILImage.new("RGB", (width, height), (10, 120, 200))
+    # Built in RGB and converted, rather than filled directly: PILImage.new
+    # wants a mode-appropriate colour, and "a blue square" is not expressible
+    # as one for L, 1, CMYK and P all at once.
+    if mode == "RGBA":
+        img = img.convert("RGBA")
+        img.putalpha(90)
+    elif mode != "RGB":
+        img = img.convert(mode)
+    buf = BytesIO()
+    img.save(buf, fmt)
+    return buf.getvalue()
+
+
+def animated_gif_bytes(frames: int = 3) -> bytes:
+    """Build an animated GIF with `frames` visibly distinct frames.
+
+    They have to differ: Pillow collapses identical frames on save, and a GIF
+    that reports n_frames == 1 tests nothing about the first-frame rule.
+    """
+    from PIL import Image as PILImage
+
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (0, 255, 255)]
+    images = [
+        PILImage.new("RGB", (20, 20), colors[i % len(colors)]) for i in range(frames)
+    ]
+    buf = BytesIO()
+    images[0].save(buf, "GIF", save_all=True, append_images=images[1:])
+    return buf.getvalue()
+
+
+def exif_rotated_jpeg(width: int, height: int, orientation: int = 6) -> bytes:
+    """Build a JPEG whose EXIF says it is rotated.
+
+    Orientation 6 means "rotate 90° clockwise to display", so a correctly
+    handled render comes back with the axes swapped relative to the stored
+    raster. This is what every phone photo looks like.
+    """
+    from PIL import Image as PILImage
+
+    img = PILImage.new("RGB", (width, height), (10, 120, 200))
+    exif = img.getexif()
+    exif[0x0112] = orientation
+    buf = BytesIO()
+    img.save(buf, "JPEG", exif=exif)
+    return buf.getvalue()
+
+
+def oversized_png_header(width: int, height: int) -> bytes:
+    """A valid PNG header declaring a huge size, with no pixel data.
+
+    Lets a test drive the decompression-bomb guard without building the
+    gigabytes such an image would really occupy — which is the whole point of
+    checking the declared size before decoding.
+    """
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        body = kind + payload
+        return (
+            struct.pack(">I", len(payload))
+            + body
+            + struct.pack(">I", zlib.crc32(body))
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IEND", b"")
 
 
 #: Minimal bytes recognized as an OLE2/CFB container (legacy or encrypted

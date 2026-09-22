@@ -66,8 +66,17 @@ deliberately not wrapped as a tool.
 `seafile_read_file` extracts real text from PDF, Word, PowerPoint, and Excel files
 instead of returning their raw bytes as mojibake. There is no OCR anywhere — a
 scanned/image-only PDF or a textless slide/sheet comes back with an explicit notice
-instead of an error or garbage — and formatting, layout, and images are never
-preserved.
+instead of an error or garbage — and formatting, layout, and embedded images are
+never preserved.
+
+**Image files are the exception**: they are not converted to text at all. A
+`.png`/`.jpeg`/`.gif`/`.webp`/`.tiff`/`.bmp`/`.heic` is returned as an MCP *image
+block*, so a vision-capable model simply looks at it — a photo, a screenshot, a
+diagram, a scan — with no sandbox, no filesystem, and no download step. Large images
+are downscaled to fit the limits below, and the accompanying text gives the original
+dimensions and says when detail may have been lost, so the model can tell "I cannot
+read this label" from "this label is blank". Still no OCR: nothing is transcribed,
+the picture is simply shown.
 
 PDF pages and PowerPoint slides are chunkable: a bare call returns the whole
 document/deck, except that one longer than a configurable threshold (15 pages / 20
@@ -94,13 +103,24 @@ SEAFILE_MCP_PDF_PREVIEW_THRESHOLD_PAGES=all     # never preview; always extract 
 SEAFILE_MCP_PPTX_PREVIEW_THRESHOLD_SLIDES=30    # same idea, for PowerPoint slides
 SEAFILE_MCP_XLSX_PREVIEW_THRESHOLD_SHEETS=10    # same idea, for Excel sheet counts
 SEAFILE_MCP_MAX_DOWNLOAD_MB=30                  # bytes of one file held in memory
+SEAFILE_MCP_MAX_IMAGE_EDGE_PX=1568              # long edge an image is scaled down to
+SEAFILE_MCP_MAX_IMAGE_MB=5                      # ceiling on the re-encoded image
+SEAFILE_MCP_IMAGE_READS=false                   # don't return images at all
 ```
 
 `SEAFILE_MCP_MAX_DOWNLOAD_MB` is a safety limit rather than a tuning knob: one
 process serves every user, so an unbounded read is an availability problem, not a
 slow call. Over the limit, text comes back as a prefix flagged `truncated`, while a
 PDF or Office document raises — their structure lives at the end of the file, so a
-prefix cannot be parsed at all. See [docs/deploy.md](docs/deploy.md).
+prefix cannot be parsed at all — and so does an image, since a prefix of a PNG is an
+undecodable fragment rather than a smaller picture.
+
+The image limits bound the *model's context*, not just bandwidth: a tool result goes
+straight into the context window, and base64 inflates the bytes by a third. Set
+`SEAFILE_MCP_IMAGE_READS=false` for a client that cannot render image blocks or a
+model without vision — images then come back as a short text description and a
+pointer to `seafile_get_download_link`, rather than a block the host silently drops.
+See [docs/deploy.md](docs/deploy.md).
 
 ## Agent skill
 

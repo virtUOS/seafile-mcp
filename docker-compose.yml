@@ -20,6 +20,13 @@ services:
       # every user.
       SEAFILE_MCP_MAX_FILE_READ_KB: ${SEAFILE_MCP_MAX_FILE_READ_KB:-512}
       SEAFILE_MCP_MAX_DOWNLOAD_MB: ${SEAFILE_MCP_MAX_DOWNLOAD_MB:-30}
+      # Image reads. max_image_edge_px/max_image_mb bound what lands in the
+      # model's context, not what this server holds — a tool result goes
+      # straight into the context window. Set IMAGE_READS=false for a client
+      # that cannot render image blocks or a model with no vision.
+      SEAFILE_MCP_MAX_IMAGE_EDGE_PX: ${SEAFILE_MCP_MAX_IMAGE_EDGE_PX:-1568}
+      SEAFILE_MCP_MAX_IMAGE_MB: ${SEAFILE_MCP_MAX_IMAGE_MB:-5}
+      SEAFILE_MCP_IMAGE_READS: ${SEAFILE_MCP_IMAGE_READS:-true}
       SEAFILE_MCP_MUTATION_RATE_LIMIT: ${SEAFILE_MCP_MUTATION_RATE_LIMIT:-30}
       SEAFILE_MCP_REQUEST_TIMEOUT_S: ${SEAFILE_MCP_REQUEST_TIMEOUT_S:-30}
     # No `ports:` — the only way in is through Caddy.

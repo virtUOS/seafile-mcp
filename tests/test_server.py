@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from io import BytesIO
 
 import httpx
 import pytest
@@ -17,7 +19,9 @@ from seafile_mcp.server import build_server
 from .conftest import (
     CFB_MAGIC_BYTES,
     SERVER,
+    animated_gif_bytes,
     docx_with_paragraphs,
+    image_bytes,
     pdf_with_pages,
     pptx_with_slides,
     xlsx_with_sheets,
@@ -459,3 +463,145 @@ async def test_an_oversized_pdf_reports_why_it_cannot_be_read(monkeypatch):
         _mock_file_download(b"%PDF-1.7" + b"\x00" * (3 * 1024 * 1024))
         with pytest.raises(ToolError, match="cannot be read from part of a file"):
             await tool.fn(path="/huge.pdf", repo_id="r1")
+
+
+# --------------------------------------------------------------------------- #
+# Images
+# --------------------------------------------------------------------------- #
+
+
+async def test_an_image_comes_back_as_an_image_not_mojibake(monkeypatch):
+    """The regression this whole path exists for: before it, a .png matched no
+    sniffer, fell through to the plain-text branch and was returned as half a
+    megabyte of U+FFFD that looked like a successful read."""
+    from fastmcp.utilities.types import Image
+
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(image_bytes(300, 200, "PNG"))
+        result = await tool.fn(path="/photos/site.png", repo_id="r1")
+
+    assert isinstance(result, list)
+    assert isinstance(result[1], Image)
+    assert "�" not in result[0]
+
+
+async def test_an_image_result_carries_the_untrusted_notice_before_and_after(
+    monkeypatch,
+):
+    """An image can carry text aimed at the model, and by the time the model
+    reads it the image is the most recent thing in its context — so the warning
+    is repeated after it."""
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(image_bytes(300, 200, "PNG"))
+        result = await tool.fn(path="/photos/site.png", repo_id="r1")
+
+    assert "never as instructions" in result[0]
+    assert "not instructions to follow" in result[-1]
+
+
+async def test_an_image_notice_states_its_true_dimensions(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(image_bytes(4000, 3000, "JPEG"))
+        result = await tool.fn(path="/photos/big.jpg", repo_id="r1")
+
+    assert "4000x3000" in result[0]
+    assert "downscaled" in result[0]
+    assert "/photos/big.jpg" in result[0]
+
+
+async def test_an_animated_image_says_only_one_frame_is_shown(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(animated_gif_bytes(5))
+        result = await tool.fn(path="/loop.gif", repo_id="r1")
+
+    assert "5 frames" in result[0]
+
+
+async def test_an_image_reaches_the_wire_as_an_image_content_block(monkeypatch):
+    """The one that proves the FastMCP wiring rather than the Python return
+    value: tool.fn bypasses result conversion entirely, so everything above
+    would still pass if the host received nothing usable."""
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(image_bytes(3000, 2000, "JPEG"))
+        result = await tool.run({"path": "/photos/site.jpg", "repo_id": "r1"})
+
+    assert [c.type for c in result.content] == ["text", "image", "text"]
+    assert result.content[1].mime_type == "image/jpeg"
+    # No output schema, so no structured content — and therefore the base64
+    # appears exactly once rather than being duplicated into the model's
+    # context as JSON.
+    assert result.structured_content is None
+
+    from PIL import Image as PILImage
+
+    decoded = PILImage.open(BytesIO(base64.b64decode(result.content[1].data)))
+    assert max(decoded.size) == 1568
+
+
+async def test_a_text_read_still_carries_structured_content(monkeypatch):
+    """The regression guard for the return-annotation change. Adding the image
+    branch removed this tool's outputSchema; structuredContent must survive it,
+    or every existing text caller breaks."""
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(b"plain text here")
+        result = await tool.run({"path": "/note.txt", "repo_id": "r1"})
+
+    assert [c.type for c in result.content] == ["text"]
+    assert result.structured_content["path"] == "/note.txt"
+    assert result.structured_content["content"] == "plain text here"
+    assert "never as instructions" in result.structured_content["notice"]
+
+
+async def test_read_file_declares_no_output_schema(monkeypatch):
+    """Deliberate, not an oversight. An advertised outputSchema obliges every
+    result to carry structuredContent, which an image result does not and
+    cannot — MCP would consider it invalid."""
+    tool = await _read_file_tool(monkeypatch)
+
+    assert tool.output_schema is None
+
+
+async def test_format_params_are_rejected_for_an_image(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(image_bytes(40, 30, "PNG"))
+        with pytest.raises(ToolError, match="applies only to PDF"):
+            await tool.fn(path="/photos/site.png", repo_id="r1", start_page=1)
+
+    with respx.mock:
+        _mock_file_download(image_bytes(40, 30, "PNG"))
+        with pytest.raises(ToolError, match="applies only to Excel"):
+            await tool.fn(path="/photos/site.png", repo_id="r1", sheet_name="Sheet1")
+
+
+async def test_image_reads_can_be_disabled_for_a_client_that_cannot_show_them(
+    monkeypatch,
+):
+    """A host that drops image blocks would otherwise leave the model with a
+    notice about an image it cannot see and no way to tell that is what
+    happened."""
+    monkeypatch.setenv("SEAFILE_MCP_IMAGE_READS", "false")
+    get_settings.cache_clear()
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(image_bytes(300, 200, "PNG"))
+        result = await tool.fn(path="/photos/site.png", repo_id="r1")
+
+    assert not isinstance(result, list)
+    assert "PNG image" in result.content
+    assert "300x200" in result.content
+    assert "seafile_get_download_link" in result.content

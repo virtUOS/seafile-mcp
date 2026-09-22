@@ -278,8 +278,8 @@ class SeafileClient:
         A file over the limit is not discarded outright. As soon as enough
         bytes have arrived to recognise the format, one of two things happens:
 
-        - the format needs its whole file to parse (PDF, OOXML, OLE2), so we
-          stop immediately and raise. Returning a prefix would only produce a
+        - the format needs its whole file to parse (PDF, OOXML, OLE2, and any
+          image), so we stop immediately and raise. Returning a prefix would only produce a
           parse error later, and this way a 2 GB PDF costs one chunk rather
           than the full limit.
         - anything else is text, where a prefix *is* usable, so we fill up to
@@ -325,8 +325,8 @@ class SeafileClient:
                             f"{declared / (1024 * 1024):.1f} MB, over this "
                             f"server's {settings.max_download_mb} MB limit, and "
                             f"its format cannot be read from part of a file — a "
-                            f"PDF or Office document needs its whole self to "
-                            f"open. Nothing was downloaded. Use "
+                            f"PDF, Office document or image needs all of its "
+                            f"bytes to open. Nothing was downloaded. Use "
                             f"seafile_get_download_link to fetch it directly."
                         )
 
@@ -350,9 +350,9 @@ class SeafileClient:
             raise SafetyError(
                 f"{normalize_path(path)} is larger than this server's "
                 f"{settings.max_download_mb} MB limit, and its format cannot be "
-                f"read from part of a file — a PDF or Office document needs its "
-                f"whole self to open. Use seafile_get_download_link to fetch it "
-                f"directly."
+                f"read from part of a file — a PDF, Office document or image "
+                f"needs all of its bytes to open. Use seafile_get_download_link "
+                f"to fetch it directly."
             )
 
         # Not `declared or None`: a genuinely empty file declares 0, and that
