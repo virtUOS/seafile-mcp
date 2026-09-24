@@ -63,8 +63,9 @@ deliberately not wrapped as a tool.
 
 (Under Development)
 
-`seafile_read_file` extracts real text from PDF, Word, PowerPoint, and Excel files
-instead of returning their raw bytes as mojibake. There is no OCR anywhere — a
+`seafile_read_file` extracts real text from PDF, Word, PowerPoint, Excel and
+OpenDocument (`.odt`/`.ods`/`.odp`) files instead of returning their raw bytes as
+mojibake. There is no OCR anywhere — a
 scanned/image-only PDF or a textless slide/sheet comes back with an explicit notice
 instead of an error or garbage — and formatting, layout, and embedded images are
 never preserved.
@@ -91,9 +92,29 @@ the two are never ambiguous. Word documents are always extracted in full — Wor
 stores no page boundaries in the file itself, so there's no natural unit to chunk by
 yet.
 
-A legacy pre-2007 binary Office file (`.doc`/`.xls`/`.ppt`) or a password-protected
-`.docx`/`.xlsx`/`.pptx` can't be parsed at all and raises a clear error rather than
-falling through to mojibake.
+LibreOffice files are read the same way as their Microsoft counterparts and share
+their settings: `.ods` chunks by `sheet_name` like `.xlsx`, `.odp` by
+`start_slide`/`end_slide` like `.pptx`, and `.odt` has no page range for the same
+reason `.docx` doesn't — neither format stores page boundaries. In `.odt`, headings
+are marked with a leading `#` and tables stay inline where they appear.
+
+A legacy pre-2007 binary Office file (`.doc`/`.xls`/`.ppt`), or a password-protected
+Office or OpenDocument file, can't be parsed at all and raises a clear error rather
+than falling through to mojibake.
+
+### Plain text, encodings, and long files
+
+Text files are read as UTF-8 unless a byte-order mark says otherwise. A BOM is an
+explicit declaration inside the file, so honouring it is not encoding *detection* —
+this server never guesses a charset. What it does instead is count: any bytes that
+could not be decoded become U+FFFD, and `decode_replacements` plus the `notice` say
+how many, so a model knows not to quote that passage as the document's wording. This
+matters most for a German `.csv` exported by Excel, which is Windows-1252 by default
+and whose every umlaut would otherwise be silently destroyed.
+
+Any result cut short by the size limit carries `next_offset`; pass it back as
+`offset` to read on. That is the only way to reach the rest of a long Word, `.odt`,
+CSV or log file, none of which have a page or sheet to chunk by.
 
 System admins can tune or disable each preview threshold independently:
 

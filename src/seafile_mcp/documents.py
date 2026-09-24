@@ -35,12 +35,14 @@ bytes alone.
 
 from __future__ import annotations
 
+import codecs
 import zipfile
 from io import BytesIO
 from typing import NamedTuple
 
 import openpyxl
 from docx import Document as DocxDocument
+from lxml import etree
 from PIL import Image as PILImage
 from PIL import ImageOps
 from pptx import Presentation
@@ -76,6 +78,33 @@ def check_page_range(
             f"{end_name} ({end_page}) is before {start_name} ({start_page}); "
             f"the range is inclusive."
         )
+
+
+def _resolve_sheet_selection(
+    all_names: tuple[str, ...],
+    sheet_name: str | None,
+    preview_threshold: int | None,
+    *,
+    noun: str,
+) -> tuple[tuple[str, ...], bool]:
+    """Decide which named sheets to extract.
+
+    Shared by ``extract_xlsx_text`` and ``extract_ods_text``. Kept in one place
+    deliberately: the prose of the two notices can differ per format without
+    anyone minding, but the *rule* for which sheets a bare call returns is one
+    decision, and two copies of it would drift the first time the threshold
+    behaviour is touched.
+    """
+    if sheet_name is not None:
+        if sheet_name not in all_names:
+            raise ValueError(
+                f"This {noun} has no sheet named {sheet_name!r}. Available "
+                f"sheets: {', '.join(all_names)}."
+            )
+        return (sheet_name,), False
+    if preview_threshold is None or len(all_names) <= preview_threshold:
+        return all_names, False
+    return all_names[:1], True
 
 
 def _resolve_numbered_range(
@@ -408,21 +437,34 @@ def slide_notice(x: PptxExtract) -> str:
     Mirrors :func:`page_notice`: always states the deck's true total slide
     count alongside any partial-range explanation.
     """
-    if (x.first_slide, x.last_slide) == (1, x.slide_count):
+    return _slide_notice_text(
+        x.slide_count, x.first_slide, x.last_slide, x.auto_previewed
+    )
+
+
+def _slide_notice_text(
+    slide_count: int, first_slide: int, last_slide: int, auto_previewed: bool
+) -> str:
+    """The wording shared by .pptx and .odp.
+
+    Both are decks of slides, and a model should not have to learn that the
+    sentence changes with whichever office suite wrote the file.
+    """
+    if (first_slide, last_slide) == (1, slide_count):
         return (
-            f" This presentation has {x.slide_count} slide(s), all of which "
+            f" This presentation has {slide_count} slide(s), all of which "
             f"were extracted."
         )
-    if x.auto_previewed:
+    if auto_previewed:
         return (
-            f" This presentation has {x.slide_count} slide(s); only the first "
-            f"{x.last_slide} were extracted by default because it is long. Call "
+            f" This presentation has {slide_count} slide(s); only the first "
+            f"{last_slide} were extracted by default because it is long. Call "
             f"this tool again with start_slide/end_slide set to a specific "
-            f"range, or end_slide={x.slide_count} to read the rest."
+            f"range, or end_slide={slide_count} to read the rest."
         )
     return (
-        f" This presentation has {x.slide_count} slide(s); slides "
-        f"{x.first_slide}-{x.last_slide} were extracted. Call this tool again "
+        f" This presentation has {slide_count} slide(s); slides "
+        f"{first_slide}-{last_slide} were extracted. Call this tool again "
         f"with start_slide/end_slide to read other slides."
     )
 
@@ -494,21 +536,9 @@ def extract_xlsx_text(
         raise ValueError(f"Could not parse this Excel file: {exc}") from None
 
     all_names = tuple(wb.sheetnames)
-
-    if sheet_name is not None:
-        if sheet_name not in all_names:
-            raise ValueError(
-                f"This workbook has no sheet named {sheet_name!r}. Available "
-                f"sheets: {', '.join(all_names)}."
-            )
-        to_extract: tuple[str, ...] = (sheet_name,)
-        auto_previewed = False
-    elif preview_threshold_sheets is None or len(all_names) <= preview_threshold_sheets:
-        to_extract = all_names
-        auto_previewed = False
-    else:
-        to_extract = all_names[:1]
-        auto_previewed = True
+    to_extract, auto_previewed = _resolve_sheet_selection(
+        all_names, sheet_name, preview_threshold_sheets, noun="workbook"
+    )
 
     rendered = []
     for name in to_extract:
@@ -535,23 +565,614 @@ def sheet_notice(x: XlsxExtract) -> str:
     Always lists every sheet name, so the model knows what else exists even
     when only one sheet was actually extracted.
     """
-    names_list = ", ".join(x.sheet_names)
-    if x.auto_previewed:
+    return _sheet_notice_text(
+        x.sheet_names, x.extracted_sheets, x.auto_previewed, noun="workbook"
+    )
+
+
+def _sheet_notice_text(
+    sheet_names: tuple[str, ...],
+    extracted_sheets: tuple[str, ...],
+    auto_previewed: bool,
+    *,
+    noun: str,
+) -> str:
+    """The wording shared by .xlsx and .ods, differing only in the noun.
+
+    Always lists every sheet name, so the model knows what else exists even
+    when only one sheet was actually extracted.
+    """
+    names_list = ", ".join(sheet_names)
+    if auto_previewed:
         return (
-            f" This workbook has {len(x.sheet_names)} sheet(s): {names_list}. "
-            f"Only the first sheet ('{x.extracted_sheets[0]}') was extracted by "
+            f" This {noun} has {len(sheet_names)} sheet(s): {names_list}. "
+            f"Only the first sheet ('{extracted_sheets[0]}') was extracted by "
             f"default because there are many sheets. Call this tool again with "
             f"sheet_name set to one of the names above to read another."
         )
-    if len(x.extracted_sheets) == 1 and len(x.sheet_names) > 1:
+    if len(extracted_sheets) == 1 and len(sheet_names) > 1:
         return (
-            f" This workbook has {len(x.sheet_names)} sheet(s): {names_list}. "
-            f"Only sheet '{x.extracted_sheets[0]}' was extracted, as requested. "
+            f" This {noun} has {len(sheet_names)} sheet(s): {names_list}. "
+            f"Only sheet '{extracted_sheets[0]}' was extracted, as requested. "
             f"Call this tool again with a different sheet_name to read another."
         )
     return (
-        f" This workbook has {len(x.sheet_names)} sheet(s): {names_list}, all "
+        f" This {noun} has {len(sheet_names)} sheet(s): {names_list}, all "
         f"of which were extracted."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# OpenDocument (.odt / .ods / .odp)
+# --------------------------------------------------------------------------- #
+
+#: ODF namespace URIs. Stable across ODF 1.0-1.4: the version is an attribute
+#: on the root element, not part of the namespace, so one set covers every file
+#: LibreOffice has written.
+_OFFICE_NS = "urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+_TEXT_NS = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+_TABLE_NS = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+_DRAW_NS = "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+_PRESENTATION_NS = "urn:oasis:names:tc:opendocument:xmlns:presentation:1.0"
+_MANIFEST_NS = "urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"
+
+
+def _q(ns: str, tag: str) -> str:
+    return f"{{{ns}}}{tag}"
+
+
+_TEXT_H = _q(_TEXT_NS, "h")
+_TEXT_P = _q(_TEXT_NS, "p")
+_TEXT_S = _q(_TEXT_NS, "s")
+_TEXT_TAB = _q(_TEXT_NS, "tab")
+_TEXT_BR = _q(_TEXT_NS, "line-break")
+_TEXT_C = _q(_TEXT_NS, "c")
+_OUTLINE_LEVEL = _q(_TEXT_NS, "outline-level")
+_TRACKED_CHANGES = _q(_TEXT_NS, "tracked-changes")
+_TABLE = _q(_TABLE_NS, "table")
+_TABLE_ROW = _q(_TABLE_NS, "table-row")
+_TABLE_CELL = _q(_TABLE_NS, "table-cell")
+_COVERED_CELL = _q(_TABLE_NS, "covered-table-cell")
+_COLS_REPEATED = _q(_TABLE_NS, "number-columns-repeated")
+_ROWS_REPEATED = _q(_TABLE_NS, "number-rows-repeated")
+_TABLE_NAME = _q(_TABLE_NS, "name")
+_DRAW_PAGE = _q(_DRAW_NS, "page")
+_PRESENTATION_NOTES = _q(_PRESENTATION_NS, "notes")
+_ENCRYPTION_DATA = _q(_MANIFEST_NS, "encryption-data")
+_OFFICE_VALUE = _q(_OFFICE_NS, "value")
+_OFFICE_STRING_VALUE = _q(_OFFICE_NS, "string-value")
+
+#: Media types accepted per format. The -template variants are included
+#: because a .ott letterhead is the same document structure and the only other
+#: answer for one is mojibake. Drawing, formula and database packages
+#: (.odg/.odf/.odb) are deliberately absent: they carry no paragraph flow worth
+#: extracting, so they keep falling through to the plain-text path.
+_ODF_TEXT_TYPES = frozenset(
+    {
+        "application/vnd.oasis.opendocument.text",
+        "application/vnd.oasis.opendocument.text-template",
+        "application/vnd.oasis.opendocument.text-master",
+    }
+)
+_ODF_SPREADSHEET_TYPES = frozenset(
+    {
+        "application/vnd.oasis.opendocument.spreadsheet",
+        "application/vnd.oasis.opendocument.spreadsheet-template",
+    }
+)
+_ODF_PRESENTATION_TYPES = frozenset(
+    {
+        "application/vnd.oasis.opendocument.presentation",
+        "application/vnd.oasis.opendocument.presentation-template",
+    }
+)
+
+#: Longest media type above is 52 bytes; read a little more so a malformed
+#: entry is recognised as malformed rather than silently truncated into a
+#: match. Bounded because a zip entry named "mimetype" can be a deflate bomb
+#: like any other.
+_MAX_MEDIA_TYPE_BYTES = 128
+
+#: Ceiling on the *decompressed* content.xml. max_download_mb bounds what
+#: arrives over the wire and says nothing about this: deflate reaches roughly
+#: 1000:1, so 30 MB of zip can declare gigabytes of XML, and an lxml tree costs
+#: several times its source. Checked before the bytes are materialised, for the
+#: same reason MAX_IMAGE_PIXELS is checked before a pixel is decoded.
+MAX_ODF_XML_BYTES = 32 * 1024 * 1024
+
+#: Ceiling on any one repeat count. ODF writes runs of identical or empty cells
+#: as a single element with a repeat attribute, and LibreOffice pads the last
+#: row of a sheet out to column 16384 and the sheet out to row 1048576 that
+#: way. Expanding those literally is a memory bomb built out of an ordinary
+#: spreadsheet, never mind a hostile one. text:c (repeated spaces) is clamped
+#: by the same constant for the same reason.
+_MAX_ODF_REPEAT = 1024
+
+
+def _odf_parser() -> etree.XMLParser:
+    """The one parser configuration for every ODF part this module reads.
+
+    The flags are a security contract, not tuning. ``resolve_entities=False``
+    leaves an entity reference as an unexpanded node instead of substituting
+    it, so no amount of nested ``<!ENTITY>`` declarations can amplify anything
+    (billion laughs and quadratic blowup are dead, not merely slowed) and a
+    SYSTEM entity can never pull a local file into a tool result.
+    ``load_dtd``/``no_network`` stop the external subset being fetched at all,
+    and ``huge_tree=False`` keeps libxml2's depth limit, which a real document
+    is nowhere near and a nesting bomb exceeds immediately.
+
+    This is the same stance python-docx, python-pptx and openpyxl already take
+    on the OOXML side of this module: an ODF adds no class of XML exposure this
+    process did not already have, and this way it adds none of its own.
+    """
+    return etree.XMLParser(
+        resolve_entities=False, load_dtd=False, no_network=True, huge_tree=False
+    )
+
+
+def _odf_int(value: str | None, default: int) -> int:
+    """Read a repeat-count attribute, clamped and never raising.
+
+    A malformed or absent count means "once"; an enormous one means
+    ``_MAX_ODF_REPEAT``. Both are cases where guessing low is safe and the
+    alternative is either a crash or an allocation chosen by whoever wrote
+    the file.
+    """
+    if value is None:
+        return default
+    try:
+        return max(0, min(int(value), _MAX_ODF_REPEAT))
+    except ValueError:
+        return default
+
+
+def _odf_media_type(data: bytes) -> str | None:
+    """The media type an ODF package declares, or None if it is not one.
+
+    Checked on content, never on the filename/extension, like every other
+    format here. ODF requires the ``mimetype`` entry to be first and stored
+    uncompressed; this checks only that it is *present*, because a package a
+    user unzipped and zipped up again loses that ordering and is still a file
+    LibreOffice opens. Refusing it would be refusing over a property with no
+    bearing on whether we can read it.
+    """
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as zf:
+            if "mimetype" not in zf.namelist():
+                return None
+            with zf.open("mimetype") as fh:
+                return fh.read(_MAX_MEDIA_TYPE_BYTES).decode("ascii", errors="replace")
+    except Exception:
+        # BadZipFile, a truncated archive, or RuntimeError for a
+        # password-protected zip *entry* — none of which is an ODF we can read.
+        return None
+
+
+def is_odt(data: bytes) -> bool:
+    """True if the bytes are an OpenDocument text document (.odt/.ott).
+
+    Checked on content, never on the filename/extension.
+    """
+    return _odf_media_type(data) in _ODF_TEXT_TYPES
+
+
+def is_ods(data: bytes) -> bool:
+    """True if the bytes are an OpenDocument spreadsheet (.ods/.ots).
+
+    Checked on content, never on the filename/extension.
+    """
+    return _odf_media_type(data) in _ODF_SPREADSHEET_TYPES
+
+
+def is_odp(data: bytes) -> bool:
+    """True if the bytes are an OpenDocument presentation (.odp/.otp).
+
+    Checked on content, never on the filename/extension.
+    """
+    return _odf_media_type(data) in _ODF_PRESENTATION_TYPES
+
+
+def _odf_is_encrypted(zf: zipfile.ZipFile) -> bool:
+    """True if the package's manifest declares any encrypted part.
+
+    A password-protected ODF is still a valid zip with a readable mimetype, so
+    ``is_legacy_or_encrypted_office`` cannot see it — that one sniffs the OLE2
+    container OOXML encryption uses, and ODF uses none. The manifest stays in
+    the clear because it carries the key-derivation parameters, and names an
+    ``encryption-data`` element per encrypted part.
+
+    Matched on element name rather than by searching the manifest's bytes, so a
+    package that merely *contains* a file called ``encryption-data.png`` is not
+    reported as password-protected.
+    """
+    if "META-INF/manifest.xml" not in zf.namelist():
+        return False
+    try:
+        with zf.open("META-INF/manifest.xml") as fh:
+            manifest = etree.fromstring(
+                fh.read(MAX_ODF_XML_BYTES), parser=_odf_parser()
+            )
+    except Exception:
+        return False
+    return manifest.find(f".//{_ENCRYPTION_DATA}") is not None
+
+
+def _odf_content_root(data: bytes, noun: str) -> etree._Element:
+    """Open an ODF package and return the parsed root of content.xml.
+
+    The password check comes first and gets its own diagnosis: unlike the OOXML
+    case there are no magic bytes to sniff, so without it a protected file
+    would reach the parser as ciphertext and be reported as corrupt.
+    """
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as zf:
+            if _odf_is_encrypted(zf):
+                raise ValueError(
+                    f"This {noun} is password-protected, so this server cannot "
+                    f"read it. Remove the password in LibreOffice, or use "
+                    f"seafile_get_download_link to fetch the file itself."
+                )
+            with zf.open("content.xml") as fh:
+                # One byte past the cap, so "exactly at the cap" is not
+                # mistaken for "over it" — the same strict-greater reasoning as
+                # the download cap in client.read_file_bytes.
+                xml = fh.read(MAX_ODF_XML_BYTES + 1)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Could not parse this {noun}: {exc}") from None
+
+    if len(xml) > MAX_ODF_XML_BYTES:
+        raise ValueError(
+            f"This {noun} holds more than "
+            f"{MAX_ODF_XML_BYTES // (1024 * 1024)} MB of uncompressed XML, "
+            f"past what this server will parse. Use seafile_get_download_link "
+            f"to fetch it directly."
+        )
+
+    try:
+        return etree.fromstring(xml, parser=_odf_parser())
+    except etree.XMLSyntaxError as exc:
+        raise ValueError(f"Could not parse this {noun}: {exc}") from None
+
+
+def _odf_inline_text(el: etree._Element) -> str:
+    """Flatten one text:p or text:h to a string.
+
+    Walked with an explicit stack rather than recursively: a node's tail text
+    belongs *after* its whole subtree, so a naive pre-order emit puts it in the
+    wrong place the moment a span has children of its own.
+
+    ODF encodes runs of spaces, tabs and line breaks as elements rather than as
+    characters, so those three are substituted rather than read. Nodes whose
+    tag is not a string are lxml's comments and processing instructions: their
+    text is invisible in LibreOffice, and text nobody can see in the editor has
+    no business appearing in a model's context.
+    """
+    parts: list[str] = []
+    stack: list[tuple[etree._Element, bool]] = [(el, False)]
+    while stack:
+        node, exiting = stack.pop()
+        if exiting:
+            if node is not el and node.tail:
+                parts.append(node.tail)
+            continue
+        if isinstance(node.tag, str):
+            if node.tag == _TEXT_S:
+                parts.append(" " * _odf_int(node.get(_TEXT_C), 1))
+            elif node.tag == _TEXT_TAB:
+                parts.append("\t")
+            elif node.tag == _TEXT_BR:
+                parts.append("\n")
+            elif node.text:
+                parts.append(node.text)
+        stack.append((node, True))
+        for child in reversed(list(node)):
+            stack.append((child, False))
+    return "".join(parts)
+
+
+def _odf_cell_text(cell: etree._Element) -> str:
+    """One table cell, as the person who saved it saw it.
+
+    The displayed paragraphs first, not office:value: a spreadsheet written in
+    a German locale shows 1234.5 as "1.234,50 EUR", and the formatted string is
+    both what a reader would quote and, for a formula cell, its last-saved
+    computed value — the same contract extract_xlsx_text states for
+    ``data_only=True``. The typed attributes are a fallback for producers that
+    write a value with no display paragraph.
+    """
+    paragraphs = [
+        _odf_inline_text(p)
+        for p in cell
+        if isinstance(p.tag, str) and p.tag in (_TEXT_P, _TEXT_H)
+    ]
+    text = " ".join(p for p in paragraphs if p)
+    if text:
+        return text
+    typed = cell.get(_OFFICE_STRING_VALUE) or cell.get(_OFFICE_VALUE)
+    return typed or ""
+
+
+def _odf_table_rows(table: etree._Element) -> list[str]:
+    """Render one table:table as tab-separated rows.
+
+    ODF does not store one element per cell: a run of identical or empty cells
+    is a single element with a repeat count, and LibreOffice pads every row out
+    to column 16384 and every sheet to row 1048576 that way. Expanding those
+    literally turns a two-column spreadsheet into gigabytes, so an empty run is
+    held as a gap and materialised only when something non-empty follows it.
+    That drops the trailing padding for free while keeping the column positions
+    of everything real, and an all-empty row disappears entirely — matching
+    what the .xlsx path does at ``iter_rows``.
+
+    Rows are found with ``iter`` rather than by walking direct children,
+    because header rows sit inside table:table-header-rows and row groups nest.
+    """
+    rendered: list[str] = []
+    for row in table.iter(_TABLE_ROW):
+        cells: list[str] = []
+        gap = 0
+        for cell in row:
+            if not isinstance(cell.tag, str) or cell.tag not in (
+                _TABLE_CELL,
+                _COVERED_CELL,
+            ):
+                continue
+            repeat = _odf_int(cell.get(_COLS_REPEATED), 1)
+            text = _odf_cell_text(cell)
+            if text:
+                cells.extend([""] * gap)
+                gap = 0
+                cells.extend([text] * repeat)
+            else:
+                gap += repeat
+        if cells:
+            line = "\t".join(cells)
+            rendered.extend([line] * _odf_int(row.get(_ROWS_REPEATED), 1))
+    return rendered
+
+
+ODT_EXTRACTION_NOTICE = (
+    " This file was an OpenDocument text document (.odt); heading and "
+    "paragraph text was extracted in document order, with headings marked by "
+    "leading '#' characters (one per outline level — that is this server's "
+    "markup, not text in the file) and tables rendered as tab-separated rows "
+    "where they appear. Headers, footers and images are not included."
+)
+
+_PLACEHOLDER_NO_TEXT_ODT = (
+    "This OpenDocument text document contains no extractable text."
+)
+
+
+def extract_odt_text(data: bytes) -> str:
+    """Extract heading, paragraph and table text in document order.
+
+    No range parameter, for the same reason as .docx: ODF stores no page
+    boundaries, because pagination is computed when the document is rendered.
+
+    Unlike the .docx path this keeps tables where they are rather than listing
+    them at the end. The difference is deliberate, not drift: hoisting there is
+    a python-docx artifact (paragraphs and tables are separate collections), and
+    in a regulation or a module handbook the paragraph that introduces a table
+    is most of what the table means. Here we walk the body ourselves, so
+    document order costs nothing.
+
+    Tracked-changes bodies are skipped: they hold deleted text that the author
+    took out, which nobody reading the document in LibreOffice sees.
+    """
+    root = _odf_content_root(data, "OpenDocument text document")
+    body = root.find(f".//{_q(_OFFICE_NS, 'text')}")
+    if body is None:
+        return _PLACEHOLDER_NO_TEXT_ODT
+
+    blocks: list[str] = []
+    tables = 0
+    for node in body.iter():
+        if not isinstance(node.tag, str):
+            continue
+        if node.tag == _TEXT_H:
+            text = _odf_inline_text(node)
+            if text.strip():
+                level = min(max(_odf_int(node.get(_OUTLINE_LEVEL), 1), 1), 6)
+                blocks.append(f"{'#' * level} {text}")
+        elif node.tag == _TEXT_P:
+            # Paragraphs inside a table cell are rendered by the table branch,
+            # and those inside tracked-changes were deleted by their author.
+            if _odf_within(node, body, (_TABLE_CELL, _COVERED_CELL, _TRACKED_CHANGES)):
+                continue
+            text = _odf_inline_text(node)
+            if text.strip():
+                blocks.append(text)
+        elif node.tag == _TABLE:
+            if _odf_within(node, body, (_TABLE,)):
+                continue  # a nested table; its rows come with the outer one
+            tables += 1
+            rows = _odf_table_rows(node)
+            if rows:
+                blocks.append(f"[table {tables}]\n" + "\n".join(rows))
+
+    return "\n\n".join(blocks) if blocks else _PLACEHOLDER_NO_TEXT_ODT
+
+
+def _odf_within(
+    node: etree._Element, stop: etree._Element, tags: tuple[str, ...]
+) -> bool:
+    """True if any ancestor of ``node`` below ``stop`` has one of ``tags``.
+
+    Used to avoid emitting the same text twice: a paragraph inside a table cell
+    belongs to the table's rows, not to the document's paragraph flow.
+    """
+    parent = node.getparent()
+    while parent is not None and parent is not stop:
+        if isinstance(parent.tag, str) and parent.tag in tags:
+            return True
+        parent = parent.getparent()
+    return False
+
+
+ODS_EXTRACTION_NOTICE = (
+    " This file was an OpenDocument spreadsheet (.ods); cell values were "
+    "extracted as tab-separated rows, one sheet at a time, as they are "
+    "displayed rather than as stored (no formatting, charts, or images)."
+)
+
+_PLACEHOLDER_NO_TEXT_ODS_TEMPLATE = (
+    "Sheet '{sheet}' of this spreadsheet contains no data."
+)
+
+
+class OdsExtract(NamedTuple):
+    text: str
+    sheet_names: tuple[str, ...]
+    extracted_sheets: tuple[str, ...]
+    auto_previewed: bool
+
+
+def extract_ods_text(
+    data: bytes,
+    sheet_name: str | None = None,
+    preview_threshold_sheets: int | None = DEFAULT_XLSX_PREVIEW_THRESHOLD_SHEETS,
+    /,
+) -> OdsExtract:
+    """Extract cell text from an OpenDocument spreadsheet, one sheet at a time.
+
+    Chunked by sheet rather than by row for the same reason as .xlsx: a sheet,
+    not an arbitrary row index, is the unit a person names. One honest
+    difference from .xlsx, though: there the preview saves parsing work because
+    openpyxl loads lazily, whereas here content.xml is one part and is parsed
+    whatever happens, so the threshold bounds output and context cost only. It
+    is still worth having for exactly that.
+    """
+    root = _odf_content_root(data, "OpenDocument spreadsheet")
+    body = root.find(f".//{_q(_OFFICE_NS, 'spreadsheet')}")
+    tables = [t for t in body.iter(_TABLE)] if body is not None else []
+    all_names = tuple(
+        t.get(_TABLE_NAME) or f"Sheet{i}" for i, t in enumerate(tables, start=1)
+    )
+
+    to_extract, auto_previewed = _resolve_sheet_selection(
+        all_names, sheet_name, preview_threshold_sheets, noun="spreadsheet"
+    )
+
+    by_name = dict(zip(all_names, tables))
+    rendered = []
+    for name in to_extract:
+        rows = _odf_table_rows(by_name[name])
+        body_text = (
+            "\n".join(rows)
+            if rows
+            else _PLACEHOLDER_NO_TEXT_ODS_TEMPLATE.format(sheet=name)
+        )
+        rendered.append(f"[sheet: {name}]\n{body_text}")
+
+    return OdsExtract(
+        text="\n\n".join(rendered),
+        sheet_names=all_names,
+        extracted_sheets=to_extract,
+        auto_previewed=auto_previewed,
+    )
+
+
+def ods_sheet_notice(x: OdsExtract) -> str:
+    """One sentence for FileContent.notice describing what was extracted."""
+    return _sheet_notice_text(
+        x.sheet_names, x.extracted_sheets, x.auto_previewed, noun="spreadsheet"
+    )
+
+
+ODP_EXTRACTION_NOTICE = (
+    " This file was an OpenDocument presentation (.odp); the visible text on "
+    "each slide was extracted, labelled by slide number. Speaker notes, "
+    "layout, and images are not included."
+)
+
+_PLACEHOLDER_NO_TEXT_ODP_TEMPLATE = (
+    "Slide {slide} of this presentation contains no extractable text "
+    "(it may be image-only)."
+)
+
+
+class OdpExtract(NamedTuple):
+    text: str
+    slide_count: int
+    first_slide: int
+    last_slide: int
+    auto_previewed: bool
+
+
+def extract_odp_text(
+    data: bytes,
+    start_slide: int | None = None,
+    end_slide: int | None = None,
+    preview_threshold_slides: int | None = DEFAULT_PPTX_PREVIEW_THRESHOLD_SLIDES,
+    /,
+) -> OdpExtract:
+    """Extract slide text from an OpenDocument presentation.
+
+    Speaker notes are skipped, matching what the .pptx path does — there
+    python-pptx's ``shape.text_frame`` never reaches a notes slide, and
+    PPTX_EXTRACTION_NOTICE promises their absence. Two formats making the same
+    promise should keep it the same way.
+
+    Only draw:page elements count as slides. A presentation also carries
+    draw:master-page siblings holding the template's placeholder text, and
+    counting those would invent slides that nobody wrote.
+    """
+    root = _odf_content_root(data, "OpenDocument presentation")
+    body = root.find(f".//{_q(_OFFICE_NS, 'presentation')}")
+    pages = [p for p in body.iter(_DRAW_PAGE)] if body is not None else []
+    total = len(pages)
+    if total == 0:
+        return OdpExtract(
+            text=_PLACEHOLDER_NO_TEXT_ODP_TEMPLATE.format(slide=1),
+            slide_count=0,
+            first_slide=0,
+            last_slide=0,
+            auto_previewed=False,
+        )
+
+    first, last, auto_previewed = _resolve_numbered_range(
+        total,
+        start_slide,
+        end_slide,
+        preview_threshold_slides,
+        _PPTX_PREVIEW_SLIDES,
+        noun="presentation",
+        unit="slide",
+        param_name="start_slide",
+    )
+
+    rendered = []
+    for number in range(first, last + 1):
+        page = pages[number - 1]
+        parts = [
+            _odf_inline_text(node)
+            for node in page.iter()
+            if isinstance(node.tag, str)
+            and node.tag in (_TEXT_P, _TEXT_H)
+            and not _odf_within(node, page, (_PRESENTATION_NOTES,))
+        ]
+        text = "\n".join(p for p in parts if p.strip())
+        rendered.append(
+            f"[slide {number}]\n"
+            + (text or _PLACEHOLDER_NO_TEXT_ODP_TEMPLATE.format(slide=number))
+        )
+
+    return OdpExtract(
+        text="\n\n".join(rendered),
+        slide_count=total,
+        first_slide=first,
+        last_slide=last,
+        auto_previewed=auto_previewed,
+    )
+
+
+def odp_slide_notice(x: OdpExtract) -> str:
+    """One sentence for FileContent.notice describing what was extracted."""
+    return _slide_notice_text(
+        x.slide_count, x.first_slide, x.last_slide, x.auto_previewed
     )
 
 
@@ -939,6 +1560,178 @@ def is_legacy_or_encrypted_office(data: bytes) -> bool:
     return data[:8] == _CFB_MAGIC
 
 
+# --------------------------------------------------------------------------- #
+# Plain text: decoding and paging
+# --------------------------------------------------------------------------- #
+
+#: Byte-order marks, longest first. UTF-32LE's FF FE 00 00 begins with the
+#: whole of UTF-16LE's FF FE, so a shortest-first scan reads every UTF-32LE
+#: file as UTF-16LE and returns NUL-interleaved nonsense that decodes without
+#: raising — the exact silent failure this function exists to stop. The reverse
+#: collision cannot happen: a real UTF-16LE file matching FF FE 00 00 would
+#: have U+0000 as its first character.
+#:
+#: Honouring a BOM is *not* the charset detection this project rules out. A
+#: detector infers an encoding from the statistics of the bytes and is wrong
+#: often enough that visible U+FFFD beats a confident wrong guess. A BOM is the
+#: file declaring its own encoding in band — the same kind of evidence as
+#: ``%PDF-`` or ``PK\x03\x04``, which this module already trusts to pick a
+#: parser. Reading a label is not guessing, and nothing here looks at a single
+#: byte that is not a BOM.
+_BOMS: tuple[tuple[bytes, str], ...] = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+
+#: What ``errors="replace"`` substitutes for a byte it cannot decode. Named
+#: because it is counted, not just produced: the count is the only signal a
+#: caller gets that part of the text it is holding is not the file's wording.
+_REPLACEMENT_CHAR = "\ufffd"
+
+#: What a file with no BOM is read as. ``utf-8-sig`` rather than ``utf-8`` so
+#: the default branch also strips a UTF-8 BOM; on bytes that do not start with
+#: one the two codecs are byte-for-byte identical. The utf-16/utf-32 codecs
+#: likewise consume the BOM and choose the endianness themselves, which is why
+#: nothing below ever names utf-16-le or hand-strips a prefix.
+DEFAULT_TEXT_CODEC = "utf-8-sig"
+
+
+class DecodedText(NamedTuple):
+    """Text decoded from a file, and how much of it could not be read.
+
+    ``replacements`` counts the whole file, not the slice a caller is handed:
+    a page that is clean ASCII inside a file that is not UTF-8 still needs to
+    say so, or a long cp1252 CSV pages cleanly through its ASCII header rows
+    and only turns to mojibake several calls later.
+    """
+
+    text: str
+    codec: str
+    from_bom: bool
+    replacements: int
+
+
+def decode_text(data: bytes) -> DecodedText:
+    """Decode plain-text bytes, honouring a byte-order mark, never guessing.
+
+    Decodes the whole buffer rather than a prefix: slicing bytes first cuts a
+    multi-byte character in half and manufactures a replacement that was never
+    in the file, and it makes the caller's size cap mean bytes here while it
+    means characters on every other format.
+
+    Blocking on a large file, so callers run it in a worker thread like every
+    other extractor here.
+    """
+    codec, from_bom = DEFAULT_TEXT_CODEC, False
+    for bom, name in _BOMS:
+        if data.startswith(bom):
+            codec, from_bom = name, True
+            break
+
+    try:
+        # Strict first, and not only as a fast path: U+FFFD is itself a legal
+        # character (EF BF BD is valid UTF-8), so counting it in a
+        # replace-decoded string is a count of corruption only once we know
+        # there was some.
+        return DecodedText(data.decode(codec), codec, from_bom, 0)
+    except UnicodeDecodeError:
+        pass
+
+    # The BOM still stands. Trying a second codec here would be exactly the
+    # guess ruled out above, and in practice a declared encoding fails strict
+    # decoding because the download was cut mid-character, not because the
+    # label lied. What a cp1252 export needs is not another guess but a caller
+    # who is told the text is damaged.
+    text = data.decode(codec, errors="replace")
+    return DecodedText(text, codec, from_bom, text.count(_REPLACEMENT_CHAR))
+
+
+def decode_notice(x: DecodedText, in_slice: int) -> str:
+    """One sentence for the notice when bytes could not be decoded.
+
+    Silent on the happy path: every character here is spent on every read, and
+    a file that decoded cleanly has nothing to report.
+    """
+    if not x.replacements:
+        return ""
+    if in_slice:
+        where = f"{in_slice} byte sequence(s) in the text below"
+        tail = " Those characters are not the file's wording — do not quote them."
+    else:
+        where = f"{x.replacements} byte sequence(s) elsewhere in this file"
+        tail = " The part you were given decoded cleanly."
+    return (
+        f" {where} could not be decoded as {x.codec} and were replaced with "
+        f"U+FFFD.{tail} This server does not guess encodings, so this usually "
+        f"means the file is not UTF-8 at all — a Windows-1252/Latin-1 export, "
+        f"typically. Use seafile_get_download_link if you need it exactly."
+    )
+
+
+def check_text_range(offset: int | None, limit: int | None) -> None:
+    """Validate paging bounds that need no file. Raises ValueError.
+
+    Called before the download, like ``check_page_range``, so an impossible
+    request never pulls a large file for nothing.
+    """
+    if offset is not None and offset < 0:
+        raise ValueError(
+            f"offset counts characters from 0 and cannot be negative; got {offset}."
+        )
+    if limit is not None and limit < 1:
+        raise ValueError(f"limit must be 1 or greater; got {limit}.")
+
+
+class TextPage(NamedTuple):
+    text: str
+    offset: int
+    total_chars: int
+    next_offset: int | None
+
+
+def page_text(
+    text: str, offset: int | None, limit: int | None, cap: int
+) -> TextPage:
+    """Select one window of already-extracted text. Raises ValueError.
+
+    Characters, not bytes: after decoding there are no bytes left to index,
+    and the window and the cap have to mean the same unit as each other.
+
+    0-indexed, unlike ``start_page``/``start_slide``. Those name units a human
+    counts off a document; an offset is a position in a string, and in practice
+    only ever comes back from a previous call's ``next_offset``.
+
+    ``cap`` is a ceiling on ``limit``, not a default a caller may raise: it
+    exists to bound what lands in a model's context, not to be tuned per call.
+    """
+    start = offset or 0
+    if start and start >= len(text):
+        raise ValueError(
+            f"This text has {len(text)} character(s); offset={start} is past "
+            f"the end. Offsets are 0-indexed characters of the extracted text."
+        )
+    window = text[start : start + (min(limit, cap) if limit else cap)]
+    end = start + len(window)
+    return TextPage(window, start, len(text), end if end < len(text) else None)
+
+
+def continuation_notice(page: TextPage) -> str:
+    """Say where in the text this piece sits, and how to ask for the next.
+
+    Emitted only when something was left over. Before this existed, a plain-text
+    or Word read cut at the size cap said nothing beyond ``truncated=True`` and
+    the tail was unreachable by any call at all.
+    """
+    return (
+        f" This is characters {page.offset}-{page.offset + len(page.text)} of "
+        f"{page.total_chars} of the extracted text; call this tool again with "
+        f"offset={page.next_offset} for the next part."
+    )
+
+
 __all__ = [
     "requires_complete_file",
     "SNIFF_BYTES",
@@ -947,6 +1740,28 @@ __all__ = [
     "is_pptx",
     "is_xlsx",
     "is_legacy_or_encrypted_office",
+    "is_odt",
+    "is_ods",
+    "is_odp",
+    "extract_odt_text",
+    "OdsExtract",
+    "extract_ods_text",
+    "ods_sheet_notice",
+    "OdpExtract",
+    "extract_odp_text",
+    "odp_slide_notice",
+    "ODT_EXTRACTION_NOTICE",
+    "ODS_EXTRACTION_NOTICE",
+    "ODP_EXTRACTION_NOTICE",
+    "MAX_ODF_XML_BYTES",
+    "DecodedText",
+    "decode_text",
+    "decode_notice",
+    "DEFAULT_TEXT_CODEC",
+    "check_text_range",
+    "TextPage",
+    "page_text",
+    "continuation_notice",
     "is_image",
     "RenderedImage",
     "render_image",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import zipfile
 from io import BytesIO
 
 import pytest
@@ -191,6 +192,141 @@ def oversized_png_header(width: int, height: int) -> bytes:
 
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IEND", b"")
+
+
+#: A line of German that exercises every byte a cp1252 export gets wrong: the
+#: three umlauts, the sharp s, and the Euro sign — the character that tells
+#: cp1252 (0x80) apart from true Latin-1, which has no Euro at all.
+GERMAN_TEXT = "Prüfungsordnung für Größe\nStraße 5\tGebühr: 12,50 €\n"
+
+#: ODF media types. Repeated here rather than imported from documents.py: a
+#: test that builds its input from the same constant the code matches on
+#: cannot catch that constant being wrong.
+ODT_MIME = "application/vnd.oasis.opendocument.text"
+ODS_MIME = "application/vnd.oasis.opendocument.spreadsheet"
+ODP_MIME = "application/vnd.oasis.opendocument.presentation"
+
+#: The namespace declarations every ODF body fragment below needs.
+ODF_NS = (
+    'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+    'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+    'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+    'xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" '
+    'xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0"'
+)
+
+
+def odf_bytes(
+    media_type: str,
+    body_xml: str,
+    *,
+    manifest: str | None = None,
+    mimetype_first: bool = True,
+    include_mimetype: bool = True,
+    content_override: bytes | None = None,
+) -> bytes:
+    """Build a minimal ODF package around the given office:body XML.
+
+    Hand-built rather than written with an ODF library, because this project
+    has none — the same reason oversized_png_header exists. The three parts
+    below are all documents.py ever consults, and the real LibreOffice files in
+    docs_format_test_/ confirm the shape. The keyword arguments exist so a test
+    can build the packages LibreOffice does *not* write: re-zipped so mimetype
+    is no longer first, missing it entirely, password-protected, or corrupt.
+    """
+    content = content_override if content_override is not None else (
+        f'<?xml version="1.0"?><office:document-content {ODF_NS}>'
+        f"{body_xml}</office:document-content>"
+    ).encode()
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if include_mimetype and mimetype_first:
+            info = zipfile.ZipInfo("mimetype")
+            info.compress_type = zipfile.ZIP_STORED
+            zf.writestr(info, media_type)
+        zf.writestr(
+            "META-INF/manifest.xml",
+            manifest or '<?xml version="1.0"?><manifest:manifest '
+            'xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"/>',
+        )
+        zf.writestr("content.xml", content)
+        if include_mimetype and not mimetype_first:
+            zf.writestr("mimetype", media_type)
+    return buf.getvalue()
+
+
+def odt_bytes(body_inner: str, **kw) -> bytes:
+    """An .odt whose office:text holds `body_inner`."""
+    return odf_bytes(
+        ODT_MIME, f"<office:body><office:text>{body_inner}</office:text></office:body>", **kw
+    )
+
+
+def ods_bytes(sheets: dict[str, list[list[str]]] | None = None, raw: str = "", **kw) -> bytes:
+    """An .ods built from {sheet name: rows of cell text}, or from raw XML.
+
+    `raw` is the escape hatch for the repeat-count and padding cases, which are
+    about attributes no cell-text mapping can express.
+    """
+    if raw:
+        body = raw
+    else:
+        body = ""
+        for name, rows in (sheets or {}).items():
+            cells = "".join(
+                "<table:table-row>"
+                + "".join(
+                    f"<table:table-cell><text:p>{c}</text:p></table:table-cell>"
+                    for c in row
+                )
+                + "</table:table-row>"
+                for row in rows
+            )
+            body += f'<table:table table:name="{name}">{cells}</table:table>'
+    return odf_bytes(
+        ODS_MIME,
+        f"<office:body><office:spreadsheet>{body}</office:spreadsheet></office:body>",
+        **kw,
+    )
+
+
+def odp_bytes(slide_texts: list[str], *, notes: str | None = None, **kw) -> bytes:
+    """An .odp with one draw:page per entry, optionally with speaker notes.
+
+    A draw:master-page is always included: a real presentation has one as a
+    sibling of the slides (confirmed against a LibreOffice file), and counting
+    it would invent a slide nobody wrote.
+    """
+    pages = '<draw:master-page draw:name="Default"/>'
+    for i, text in enumerate(slide_texts, start=1):
+        note_xml = (
+            f"<presentation:notes><draw:frame><draw:text-box><text:p>{notes}"
+            f"</text:p></draw:text-box></draw:frame></presentation:notes>"
+            if notes
+            else ""
+        )
+        pages += (
+            f'<draw:page draw:name="Slide {i}">'
+            f"<draw:frame><draw:text-box><text:p>{text}</text:p></draw:text-box>"
+            f"</draw:frame>{note_xml}</draw:page>"
+        )
+    return odf_bytes(
+        ODP_MIME,
+        f"<office:body><office:presentation>{pages}</office:presentation></office:body>",
+        **kw,
+    )
+
+
+#: A manifest declaring the package encrypted, as LibreOffice writes when a
+#: password is set. The manifest itself stays in the clear because it carries
+#: the key-derivation parameters.
+ENCRYPTED_MANIFEST = (
+    '<?xml version="1.0"?><manifest:manifest '
+    'xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0">'
+    '<manifest:file-entry manifest:full-path="content.xml">'
+    "<manifest:encryption-data/></manifest:file-entry></manifest:manifest>"
+)
 
 
 #: Minimal bytes recognized as an OLE2/CFB container (legacy or encrypted

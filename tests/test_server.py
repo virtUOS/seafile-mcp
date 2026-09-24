@@ -18,10 +18,15 @@ from seafile_mcp.server import build_server
 
 from .conftest import (
     CFB_MAGIC_BYTES,
+    ENCRYPTED_MANIFEST,
+    GERMAN_TEXT,
     SERVER,
     animated_gif_bytes,
     docx_with_paragraphs,
     image_bytes,
+    odp_bytes,
+    ods_bytes,
+    odt_bytes,
     pdf_with_pages,
     pptx_with_slides,
     xlsx_with_sheets,
@@ -562,6 +567,11 @@ async def test_a_text_read_still_carries_structured_content(monkeypatch):
     assert result.structured_content["path"] == "/note.txt"
     assert result.structured_content["content"] == "plain text here"
     assert "never as instructions" in result.structured_content["notice"]
+    # The paging and decode fields are additive: they reach the wire without an
+    # outputSchema, which is the claim that makes adding them safe.
+    assert result.structured_content["decode_replacements"] == 0
+    assert result.structured_content["next_offset"] is None
+    assert result.structured_content["total_chars"] == len("plain text here")
 
 
 async def test_read_file_declares_no_output_schema(monkeypatch):
@@ -605,3 +615,260 @@ async def test_image_reads_can_be_disabled_for_a_client_that_cannot_show_them(
     assert "PNG image" in result.content
     assert "300x200" in result.content
     assert "seafile_get_download_link" in result.content
+
+
+# --------------------------------------------------------------------------- #
+# OpenDocument
+# --------------------------------------------------------------------------- #
+
+
+async def test_an_odt_is_read_as_text_not_as_zip_mojibake(monkeypatch):
+    """The regression this exists for: an .odt is a zip that matched no
+    sniffer, so it fell into the plain-text branch and came back as deflate
+    bytes rendered with U+FFFD, looking like a successful read."""
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(odt_bytes("<text:p>Hallo Welt</text:p>"))
+        result = await tool.fn(path="/notiz.odt", repo_id="r1")
+
+    assert result.content == "Hallo Welt"
+    assert "�" not in result.content
+    assert "PK" not in result.content
+    assert "OpenDocument text document" in result.notice
+
+
+async def test_an_ods_uses_the_excel_preview_threshold(monkeypatch):
+    """One deck/workbook-length budget for both office suites, not two."""
+    monkeypatch.setenv("SEAFILE_MCP_XLSX_PREVIEW_THRESHOLD_SHEETS", "5")
+    get_settings.cache_clear()
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(ods_bytes({f"S{i}": [["x"]] for i in range(1, 8)}))
+        result = await tool.fn(path="/noten.ods", repo_id="r1")
+
+    assert "[sheet: S1]" in result.content
+    assert "[sheet: S7]" not in result.content
+    assert "S7" in result.notice
+
+
+async def test_an_ods_accepts_sheet_name(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(ods_bytes({"A": [["eins"]], "B": [["zwei"]]}))
+        result = await tool.fn(path="/n.ods", repo_id="r1", sheet_name="B")
+
+    assert "zwei" in result.content
+    assert "eins" not in result.content
+
+
+async def test_an_odp_uses_the_powerpoint_slide_range(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(odp_bytes([f"Folie {i}" for i in range(1, 26)]))
+        result = await tool.fn(
+            path="/vortrag.odp", repo_id="r1", start_slide=4, end_slide=5
+        )
+
+    assert "Folie 4" in result.content
+    assert "Folie 1\n" not in result.content
+
+
+async def test_a_password_protected_odf_gets_a_clear_error(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(
+            odt_bytes("<text:p>x</text:p>", manifest=ENCRYPTED_MANIFEST)
+        )
+        with pytest.raises(ToolError, match="password-protected"):
+            await tool.fn(path="/geheim.odt", repo_id="r1")
+
+
+async def test_sheet_name_against_an_odt_names_the_odf_sibling(monkeypatch):
+    """The parenthetical keeps the tested substring intact while telling the
+    model that .ods takes this parameter too."""
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(odt_bytes("<text:p>x</text:p>"))
+        with pytest.raises(ToolError, match="applies only to Excel files"):
+            await tool.fn(path="/a.odt", repo_id="r1", sheet_name="S")
+
+    with respx.mock:
+        _mock_file_download(odt_bytes("<text:p>x</text:p>"))
+        with pytest.raises(ToolError, match="OpenDocument spreadsheets"):
+            await tool.fn(path="/a.odt", repo_id="r1", sheet_name="S")
+
+
+# --------------------------------------------------------------------------- #
+# Text encoding and paging
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_cp1252_file_says_how_much_of_it_is_fabricated(monkeypatch):
+    """The everyday German case: Excel's "CSV (Windows)" export. Before this,
+    every umlaut came back as U+FFFD with truncated=False and a notice that
+    said nothing, so a model quoted the mojibake as the real wording."""
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(GERMAN_TEXT.encode("cp1252"))
+        result = await tool.fn(path="/pruefungen.csv", repo_id="r1")
+
+    assert result.decode_replacements == len(
+        [c for c in GERMAN_TEXT if ord(c) > 127]
+    )
+    assert "do not quote" in result.notice
+    assert "Windows-1252" in result.notice
+
+
+async def test_a_utf16_file_reads_as_german_not_as_nul_padding(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(GERMAN_TEXT.encode("utf-16"))
+        result = await tool.fn(path="/notiz.txt", repo_id="r1")
+
+    assert result.content == GERMAN_TEXT
+    assert "\x00" not in result.content
+    assert result.decode_replacements == 0
+
+
+async def test_a_utf8_bom_does_not_end_up_in_the_first_header_cell(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download("Datum\tWert\n".encode("utf-8-sig"))
+        result = await tool.fn(path="/export.csv", repo_id="r1")
+
+    assert result.content.startswith("Datum")
+    assert "﻿" not in result.content
+
+
+async def test_text_paging_reaches_the_tail_that_used_to_be_unreachable(monkeypatch):
+    """Plain text had no range parameter at all: the tool always returned the
+    first max_file_read_kb and the rest was unreachable by any call."""
+    monkeypatch.setenv("SEAFILE_MCP_MAX_FILE_READ_KB", "1")
+    get_settings.cache_clear()
+    tool = await _read_file_tool(monkeypatch)
+    body = "".join(chr(0x41 + i % 26) for i in range(4096))
+
+    pages, offset = [], 0
+    while offset is not None:
+        with respx.mock:
+            _mock_file_download(body.encode())
+            result = await tool.fn(path="/gross.txt", repo_id="r1", offset=offset)
+        pages.append(result.content)
+        offset = result.next_offset
+
+    assert "".join(pages) == body
+    assert len(pages) == 4
+    assert result.total_chars == 4096
+
+
+async def test_the_first_page_says_where_to_continue(monkeypatch):
+    monkeypatch.setenv("SEAFILE_MCP_MAX_FILE_READ_KB", "1")
+    get_settings.cache_clear()
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(("x" * 4096).encode())
+        result = await tool.fn(path="/gross.txt", repo_id="r1")
+
+    assert result.truncated is True
+    assert result.next_offset == 1024
+    assert "offset=1024" in result.notice
+
+
+async def test_a_word_document_pages_too(monkeypatch):
+    """The other format that had no range parameter at all."""
+    monkeypatch.setenv("SEAFILE_MCP_MAX_FILE_READ_KB", "1")
+    get_settings.cache_clear()
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(docx_with_paragraphs(["w" * 600] * 5))
+        result = await tool.fn(path="/these.docx", repo_id="r1", offset=1024)
+
+    assert result.content
+    assert result.total_chars > 1024
+
+
+async def test_paging_applies_within_a_selected_pdf_range(monkeypatch):
+    """Units first, then characters of whatever they produced."""
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(pdf_with_pages(6, texted=True))
+        whole = await tool.fn(path="/r.pdf", repo_id="r1", start_page=1, end_page=2)
+    with respx.mock:
+        _mock_file_download(pdf_with_pages(6, texted=True))
+        paged = await tool.fn(
+            path="/r.pdf", repo_id="r1", start_page=1, end_page=2, offset=5, limit=10
+        )
+
+    assert paged.content == whole.content[5:15]
+
+
+async def test_an_offset_past_the_end_says_how_long_the_text_is(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(b"short")
+        with pytest.raises(ToolError, match="is past the end"):
+            await tool.fn(path="/a.txt", repo_id="r1", offset=9000)
+
+
+async def test_a_limit_above_the_server_cap_is_clamped(monkeypatch):
+    monkeypatch.setenv("SEAFILE_MCP_MAX_FILE_READ_KB", "1")
+    get_settings.cache_clear()
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(("y" * 4096).encode())
+        result = await tool.fn(path="/a.txt", repo_id="r1", limit=99999)
+
+    assert len(result.content) == 1024
+
+
+async def test_offset_is_rejected_for_an_image(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(image_bytes(40, 30, "PNG"))
+        with pytest.raises(ToolError, match="always returned whole"):
+            await tool.fn(path="/p.png", repo_id="r1", offset=10)
+
+
+async def test_an_oversized_text_file_offers_no_offset_past_the_download_cut(
+    monkeypatch,
+):
+    """Paging walks the downloaded prefix and then stops: at its end there is
+    more file and no offset this server can serve for it, so next_offset is
+    null while truncated stays True. That combination looks like a bug unless
+    you know the download itself was cut, which is what the notice says."""
+    monkeypatch.setenv("SEAFILE_MCP_MAX_DOWNLOAD_MB", "1")
+    get_settings.cache_clear()
+    tool = await _read_file_tool(monkeypatch)
+    downloaded = 1024 * 1024
+
+    with respx.mock:
+        _mock_file_download(b"a" * (3 * 1024 * 1024))
+        first = await tool.fn(path="/riesig.log", repo_id="r1")
+    # Mid-prefix there really is more to serve, so paging keeps working.
+    assert first.next_offset is not None
+
+    with respx.mock:
+        _mock_file_download(b"a" * (3 * 1024 * 1024))
+        last = await tool.fn(
+            path="/riesig.log", repo_id="r1", offset=downloaded - 100
+        )
+
+    assert last.total_chars == downloaded
+    assert last.next_offset is None
+    assert last.truncated is True
+    assert "seafile_get_download_link" in last.notice

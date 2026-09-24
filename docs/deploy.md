@@ -83,7 +83,7 @@ A file over the limit is not simply refused:
 - **Text** (Markdown, CSV, logs, source) comes back as its first
   `MAX_DOWNLOAD_MB`, flagged `truncated`, with a notice pointing at
   `seafile_get_download_link` for the rest.
-- **PDF and `.docx`/`.xlsx`/`.pptx`** raise instead. Their structure — a PDF's
+- **PDF, `.docx`/`.xlsx`/`.pptx` and `.odt`/`.ods`/`.odp`** raise instead. Their structure — a PDF's
   cross-reference table, a ZIP's central directory — sits at the *end* of the file,
   so a prefix cannot be opened at all and returning one would only produce a parse
   error later. The format is recognised from the first kilobyte, so an oversized
@@ -130,6 +130,40 @@ a notice about an image it cannot see and no way to tell that is what happened.
 
 **Verify this against your own client before relying on it.** Image-block support
 varies, and this server cannot detect what the host does with what it sends.
+
+## Text encoding
+
+Plain-text files are decoded as UTF-8 unless a byte-order mark declares otherwise.
+There is deliberately **no charset detection** here: a guessing dependency that is
+wrong produces confident nonsense, which is worse than visible damage. A BOM is not a
+guess — it is the file declaring its own encoding in band, the same kind of evidence
+as `%PDF-` — so it is honoured, which is also what rescues UTF-16 files. Left as
+UTF-8 those decode without error into NUL-interleaved text that looks fine and is
+unusable.
+
+Anything that still fails to decode becomes U+FFFD and is *counted*: the response
+carries `decode_replacements` and the notice tells the model not to quote the
+affected passage. A Windows-1252 CSV — Excel's default export on a German Windows
+machine — is the common case.
+
+One consequence for operators: the whole downloaded buffer is now decoded, not just
+the first `MAX_FILE_READ_KB`. Decoded text costs between roughly 1× and 4× the byte
+count depending on the script (German is the cheapest case, at about 1 byte per
+character), so `MAX_DOWNLOAD_MB` at 30 implies up to ~120 MB of transient string in
+the worst case, and ~26 MB for ordinary German text.
+
+## Reading past the size limit
+
+`MAX_FILE_READ_KB` is now a **page size rather than a cliff**, and it counts
+characters rather than bytes. A result cut short carries `next_offset`, and passing
+it back as `offset` returns the next page. This is what makes a long Word document,
+`.odt`, CSV or log file reachable to its end — they have no page, slide or sheet to
+chunk by.
+
+Because the server is stateless by design, each page re-downloads and re-extracts the
+file. Walking a very large file this way is expensive for the instance, and the
+`total_chars` field is what lets a model notice that and use
+`seafile_get_download_link` instead.
 
 ## Search
 

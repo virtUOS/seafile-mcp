@@ -175,10 +175,30 @@ UNTRUSTED_IMAGE_REMINDER = (
 
 
 class FileContent(BaseModel):
+    # These Field descriptions are documentation for human and programmatic
+    # readers only: seafile_read_file publishes no outputSchema (see its return
+    # annotation), so none of this prose is transmitted and a model sees only
+    # the bare values. Anything the *model* has to understand goes in `notice`.
     path: str
     content: str
     truncated: bool = False
-    size: int | None = None
+    size: int | None = Field(
+        default=None, description="Bytes of the file, not characters of content."
+    )
+    decode_replacements: int = Field(
+        default=0,
+        description="Byte sequences that were not valid UTF-8 and were replaced "
+        "with U+FFFD. Non-zero means part of this text is unreliable and should "
+        "not be quoted as the document's wording.",
+    )
+    total_chars: int = Field(
+        default=0, description="Characters of extracted text, before paging."
+    )
+    next_offset: int | None = Field(
+        default=None,
+        description="Character offset to pass back as `offset` for the next "
+        "part, or null when this is the end of what this server can return.",
+    )
     notice: str = UNTRUSTED_NOTICE
 
 

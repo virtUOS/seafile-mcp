@@ -9,6 +9,7 @@ license = { text = "MIT" }
 dependencies = [
     "fastmcp>=2.11",
     "httpx>=0.27",
+    "lxml>=5.0",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "pillow>=11.3",

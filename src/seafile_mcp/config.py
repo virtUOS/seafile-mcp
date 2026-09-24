@@ -119,10 +119,12 @@ class Settings(BaseSettings):
     #: to "all" to always extract the whole document regardless of length.
     pdf_preview_threshold_pages: int | None = DEFAULT_PDF_PREVIEW_THRESHOLD_PAGES
 
-    #: Same idea as pdf_preview_threshold_pages, for PowerPoint slides.
+    #: Same idea as pdf_preview_threshold_pages, for PowerPoint and
+    #: OpenDocument (.odp) slides — one deck-length budget, not two.
     pptx_preview_threshold_slides: int | None = DEFAULT_PPTX_PREVIEW_THRESHOLD_SLIDES
 
-    #: Same idea, for Excel workbooks: above this many sheets, a bare call
+    #: Same idea, for Excel workbooks and OpenDocument (.ods)
+    #: spreadsheets: above this many sheets, a bare call
     #: extracts only the first sheet instead of all of them. Set to "all" to
     #: always extract every sheet regardless of count.
     xlsx_preview_threshold_sheets: int | None = DEFAULT_XLSX_PREVIEW_THRESHOLD_SHEETS
