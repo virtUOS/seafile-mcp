@@ -29,6 +29,23 @@ services:
       SEAFILE_MCP_MAX_IMAGE_EDGE_PX: ${SEAFILE_MCP_MAX_IMAGE_EDGE_PX:-1568}
       SEAFILE_MCP_MAX_IMAGE_MB: ${SEAFILE_MCP_MAX_IMAGE_MB:-10}
       SEAFILE_MCP_IMAGE_READS: ${SEAFILE_MCP_IMAGE_READS:-true}
+      # OCR (optional). Off unless both URL and MODEL are set; setting only one
+      # of them is a startup error. The OCR model runs elsewhere — any
+      # OpenAI-compatible chat-completions endpoint (vLLM serving LightOnOCR is
+      # the reference) — and receives page images of library files, so point it
+      # only at infrastructure you trust with them. See docs/deploy.md.
+      SEAFILE_MCP_OCR_URL: ${SEAFILE_MCP_OCR_URL:-}
+      SEAFILE_MCP_OCR_MODEL: ${SEAFILE_MCP_OCR_MODEL:-}
+      SEAFILE_MCP_OCR_API_KEY: ${SEAFILE_MCP_OCR_API_KEY:-}
+      SEAFILE_MCP_OCR_PROMPT: ${SEAFILE_MCP_OCR_PROMPT:-}
+      SEAFILE_MCP_OCR_MAX_EDGE_PX: ${SEAFILE_MCP_OCR_MAX_EDGE_PX:-1540}
+      SEAFILE_MCP_OCR_MAX_PAGES: ${SEAFILE_MCP_OCR_MAX_PAGES:-10}
+      SEAFILE_MCP_OCR_CONCURRENCY: ${SEAFILE_MCP_OCR_CONCURRENCY:-4}
+      SEAFILE_MCP_OCR_TIMEOUT_S: ${SEAFILE_MCP_OCR_TIMEOUT_S:-120}
+      SEAFILE_MCP_OCR_MAX_TOKENS: ${SEAFILE_MCP_OCR_MAX_TOKENS:-4096}
+      SEAFILE_MCP_OCR_TEMPERATURE: ${SEAFILE_MCP_OCR_TEMPERATURE:-0.1}
+      SEAFILE_MCP_OCR_EXTRA_BODY: ${SEAFILE_MCP_OCR_EXTRA_BODY:-}
+      SEAFILE_MCP_OCR_SKIP_BLANK_PAGES: ${SEAFILE_MCP_OCR_SKIP_BLANK_PAGES:-true}
       SEAFILE_MCP_MUTATION_RATE_LIMIT: ${SEAFILE_MCP_MUTATION_RATE_LIMIT:-30}
       SEAFILE_MCP_REQUEST_TIMEOUT_S: ${SEAFILE_MCP_REQUEST_TIMEOUT_S:-30}
     # No `ports:` — the only way in is through Caddy.

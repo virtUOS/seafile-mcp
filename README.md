@@ -65,10 +65,10 @@ deliberately not wrapped as a tool.
 
 `seafile_read_file` extracts real text from PDF, Word, PowerPoint, Excel and
 OpenDocument (`.odt`/`.ods`/`.odp`) files instead of returning their raw bytes as
-mojibake. There is no OCR anywhere — a
-scanned/image-only PDF or a textless slide/sheet comes back with an explicit notice
-instead of an error or garbage — and formatting, layout, and embedded images are
-never preserved.
+mojibake. A scanned PDF page has no text to extract: where the deployment has OCR
+(below) it is transcribed in the same call, and otherwise the notice names it. A
+textless slide or sheet comes back with an explicit notice rather than an error or
+garbage. Formatting, layout, and embedded images are never preserved.
 
 **Image files are the exception**: they are not converted to text at all. A
 `.png`/`.jpeg`/`.gif`/`.webp`/`.tiff`/`.bmp`/`.heic` is returned as an MCP *image
@@ -76,8 +76,34 @@ block*, so a vision-capable model simply looks at it — a photo, a screenshot, 
 diagram, a scan — with no sandbox, no filesystem, and no download step. Large images
 are downscaled to fit the limits below, and the accompanying text gives the original
 dimensions and says when detail may have been lost, so the model can tell "I cannot
-read this label" from "this label is blank". Still no OCR: nothing is transcribed,
+read this label" from "this label is blank". `seafile_read_file` transcribes nothing:
 the picture is simply shown.
+
+### Scanned documents (OCR, optional)
+
+A deployment can add OCR by pointing the server at an OCR model. The model runs on
+its own GPU host behind any OpenAI-compatible chat-completions API; vLLM serving
+[LightOnOCR](https://github.com/lightonai/LightOnOCR) is the reference setup.
+
+**One call is enough.** `seafile_read_file` then transcribes a PDF's scanned pages
+itself, in the same call that returns its typed ones, and marks them `(OCR)`. Only
+pages without a text layer are sent, and pages that look blank — the empty backs of
+a duplex scan — are not, so a typed PDF reads exactly as before and costs no GPU
+time. If OCR is down, the read still succeeds and says which pages could not be
+transcribed.
+
+The server also registers `seafile_ocr_file` for direct use: an image's text (a
+multi-page TIFF's pages included), a copier's "searchable PDF" whose hidden text
+layer is garbled (`force_ocr=true`), or a file the agent already knows is a scan.
+Without the configuration neither OCR path exists. Each call covers a limited number
+of pages, OCR requests across all users share one concurrency cap, nothing is
+cached, and the OCR host never sees a Seafile token. Setup, model choices, and the data-protection and
+timeout considerations are in [docs/deploy.md](docs/deploy.md#ocr-optional).
+
+```bash
+SEAFILE_MCP_OCR_URL=https://gpu.example.org:8010/v1
+SEAFILE_MCP_OCR_MODEL=lightonai/LightOnOCR-2-1B
+```
 
 PDF pages and PowerPoint slides are chunkable: a bare call returns the whole
 document/deck, except that one longer than a configurable threshold (15 pages / 20

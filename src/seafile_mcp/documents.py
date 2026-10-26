@@ -5,9 +5,11 @@ files. Decoding any of these as UTF-8 (the plain-text path) silently
 "succeeds" with mojibake instead of an error. This module extracts real text
 from each format instead: PDF/Word/PowerPoint/Excel each get their own
 ``is_X``/``extract_X_text`` pair, content-sniffed on the downloaded bytes
-rather than trusted from the caller-supplied filename. There is no OCR: any
-format's scanned/image-only or otherwise textless content comes back as an
-explicit placeholder, never silent garbage.
+rather than trusted from the caller-supplied filename. Nothing here does OCR:
+any format's scanned/image-only or otherwise textless content comes back as an
+explicit placeholder, never silent garbage. OCR is a separate tool backed by a
+separate model (see ocr.py); a PDF's empty pages are reported by number so a
+caller can send exactly those to it.
 
 Image files are the one format here that does not become text at all. They are
 decoded, downscaled and re-encoded by ``render_image`` so the tool can hand the
@@ -164,15 +166,18 @@ _PDF_PREVIEW_PAGES = 2
 
 #: Appended to FileContent.notice for any PDF read, ahead of the page_notice
 #: sentence describing what was actually extracted.
+#:
+#: Says nothing about OCR either way. Whether this deployment has OCR is not a
+#: fact about the PDF: with OCR the server transcribes the textless pages and
+#: the OCR module describes them, without it empty_pages_notice lists them.
 PDF_EXTRACTION_NOTICE = (
-    " This file was a PDF; its text layer was extracted (no OCR, no layout, "
-    "tables or images)."
+    " This file was a PDF; its text layer was extracted (no layout, tables or "
+    "images)."
 )
 
 _PLACEHOLDER_NO_TEXT_TEMPLATE = (
     "Pages {first}-{last} of this PDF contain no extractable text (they may "
-    "be scanned images; this server does not do OCR). Other pages may still "
-    "contain text."
+    "be scanned images). Other pages may still contain text."
 )
 
 
@@ -185,12 +190,51 @@ def is_pdf(data: bytes) -> bool:
     return b"%PDF-" in data[:1024]
 
 
+def open_pdf(data: bytes) -> PdfReader:
+    """Parse a PDF, decrypting it if it only has an owner password.
+
+    Raises ValueError, never a pypdf exception, so callers get the same clean
+    tool error for a damaged file as for a locked one. Shared by text
+    extraction and the OCR tool, which must agree on what a page is.
+    """
+    try:
+        reader = PdfReader(BytesIO(data))
+        if reader.is_encrypted and not reader.decrypt(""):
+            raise ValueError(
+                "This PDF is password-protected and cannot be read without "
+                "the password."
+            )
+        len(reader.pages)  # forces the page tree to parse here, not later
+    except ValueError:
+        raise
+    except Exception as exc:  # pypdf.errors.PdfReadError and friends
+        raise ValueError(f"Could not parse this PDF: {exc}") from None
+    return reader
+
+
+def has_text_layer(page_text: str) -> bool:
+    """True if a page's extracted text is more than whitespace.
+
+    The one definition of "this page is a scan" in the server:
+    seafile_read_file uses it to list empty pages, and seafile_ocr_file uses it
+    to decide which pages are worth sending to the OCR model. If the two ever
+    disagreed, read_file would point at pages the OCR tool then skips.
+    """
+    return bool(page_text.strip())
+
+
 class PdfExtract(NamedTuple):
     text: str
     page_count: int
     first_page: int
     last_page: int
     auto_previewed: bool
+    #: Pages in the extracted range with no text layer, 1-indexed. Their text
+    #: is absent from ``text``, so without this they would vanish silently.
+    empty_pages: tuple[int, ...] = ()
+    #: The raw text of every page in the range, in order, "" where a page has
+    #: none. Lets the server rebuild ``text`` with OCR'd pages slotted in.
+    page_texts: tuple[str, ...] = ()
 
 
 def extract_pdf_text(
@@ -212,18 +256,8 @@ def extract_pdf_text(
     reaching this from the MCP server pass the deployment's configured
     ``Settings.pdf_preview_threshold_pages`` here.
     """
-    try:
-        reader = PdfReader(BytesIO(data))
-        if reader.is_encrypted and not reader.decrypt(""):
-            raise ValueError(
-                "This PDF is password-protected and cannot be read without "
-                "the password."
-            )
-        total = len(reader.pages)
-    except ValueError:
-        raise
-    except Exception as exc:  # pypdf.errors.PdfReadError and friends
-        raise ValueError(f"Could not parse this PDF: {exc}") from None
+    reader = open_pdf(data)
+    total = len(reader.pages)
 
     first, last, auto_previewed = _resolve_numbered_range(
         total,
@@ -236,11 +270,11 @@ def extract_pdf_text(
         param_name="start_page",
     )
 
-    pages_text = [reader.pages[i].extract_text() for i in range(first - 1, last)]
+    pages_text = [_page_text(reader, i) for i in range(first - 1, last)]
     joined = "\n\n".join(
         f"[page {first + i}]\n{page_text}"
         for i, page_text in enumerate(pages_text)
-        if page_text
+        if has_text_layer(page_text)
     )
     text = joined or _PLACEHOLDER_NO_TEXT_TEMPLATE.format(first=first, last=last)
 
@@ -250,7 +284,28 @@ def extract_pdf_text(
         first_page=first,
         last_page=last,
         auto_previewed=auto_previewed,
+        empty_pages=tuple(
+            first + i
+            for i, page_text in enumerate(pages_text)
+            if not has_text_layer(page_text)
+        ),
+        page_texts=tuple(pages_text),
     )
+
+
+def _page_text(reader: PdfReader, index: int) -> str:
+    """One page's text layer, or "" if pypdf cannot read it.
+
+    A page whose text cannot be extracted has, for every purpose here, no
+    usable text layer: it is listed as such, and with OCR it is transcribed.
+    Damaged pages are common in scans, and one of them used to fail the whole
+    read. The OCR tool's own pre-check treats them the same way, so the two
+    tools agree on which pages are scans.
+    """
+    try:
+        return reader.pages[index].extract_text()
+    except Exception:
+        return ""
 
 
 def page_notice(x: PdfExtract) -> str:
@@ -276,6 +331,42 @@ def page_notice(x: PdfExtract) -> str:
         f" This PDF has {x.page_count} page(s); pages {x.first_page}-{x.last_page} "
         f"were extracted. Call this tool again with start_page/end_page to read "
         f"other pages."
+    )
+
+
+def pages_phrase(pages: list[int] | tuple[int, ...]) -> str:
+    """'page 3' or 'pages 3-5, 9': a page list a model can read at a glance.
+
+    A scanned annex is usually a run of consecutive pages, and listing forty
+    numbers one by one costs context and hides the shape.
+    """
+    ordered = sorted(set(pages))
+    runs: list[str] = []
+    start = prev = ordered[0]
+    for n in ordered[1:] + [None]:  # type: ignore[list-item]
+        if n is not None and n == prev + 1:
+            prev = n
+            continue
+        runs.append(str(start) if start == prev else f"{start}-{prev}")
+        if n is not None:
+            start = prev = n
+    noun = "page" if len(ordered) == 1 else "pages"
+    return f"{noun} {', '.join(runs)}"
+
+
+def empty_pages_notice(x: PdfExtract) -> str:
+    """Name the pages that had no text layer, on a deployment without OCR.
+
+    With OCR configured the server transcribes those pages instead, and the
+    OCR module says what became of each one.
+    """
+    if not x.empty_pages:
+        return ""
+    them = "it" if len(x.empty_pages) == 1 else "them"
+    return (
+        f" There is no text layer on {pages_phrase(x.empty_pages)} of this PDF "
+        f"(likely scanned images), so nothing was extracted from {them}. This "
+        f"server does not do OCR."
     )
 
 
@@ -1376,16 +1467,59 @@ def _encode(img: PILImage.Image, max_bytes: int) -> tuple[bytes, str, PILImage.I
     return data, "jpeg", candidate
 
 
-def render_image(
-    data: bytes,
-    max_edge: int = DEFAULT_MAX_IMAGE_EDGE_PX,
-    max_bytes: int = DEFAULT_MAX_IMAGE_MB * 1024 * 1024,
-) -> RenderedImage:
-    """Decode, downscale and re-encode an image so a model can look at it.
+def _open_image(data: bytes) -> PILImage.Image:
+    """Identify an image from its header, decoding no pixels.
 
-    Raises ValueError on anything that cannot be decoded, rather than returning
-    something broken — the same contract as every other extractor here, and
-    what lets ``_handle_errors`` turn it into a clean ToolError.
+    ``PILImage.open`` is lazy, so this is cheap and safe on anything: the size
+    is known before a single buffer is allocated. Raises ValueError, never a
+    Pillow exception.
+    """
+    try:
+        return PILImage.open(BytesIO(data), formats=_PILLOW_FORMATS)
+    except PILImage.DecompressionBombError as exc:
+        # Pillow's own global ceiling, which it applies while parsing the
+        # header. Caught separately so the caller gets the size explanation
+        # rather than a generic "could not be decoded".
+        raise ValueError(
+            f"This image declares more pixels than this server will decode "
+            f"({exc}). Use seafile_get_download_link to fetch it directly."
+        ) from None
+    except Exception as exc:
+        raise ValueError(
+            f"This file looks like an image but could not be decoded: {exc}"
+        ) from None
+
+
+def identify_image(data: bytes) -> tuple[str, int]:
+    """(format, frame count) from the header alone. Raises ValueError.
+
+    Lets the OCR tool learn how many pages a multi-page TIFF has without
+    decoding any of them.
+    """
+    img = _open_image(data)
+    return img.format or "unknown", getattr(img, "n_frames", 1)
+
+
+class DecodedImage(NamedTuple):
+    """An image decoded to RGB or RGBA, upright, at its full source size."""
+
+    image: PILImage.Image
+    source_format: str
+    source_width: int
+    source_height: int
+    frames: int
+
+
+def decode_image(
+    data: bytes, max_edge: int = DEFAULT_MAX_IMAGE_EDGE_PX, frame: int = 0
+) -> DecodedImage:
+    """Decode one frame of an image safely, without resizing it.
+
+    Shared by ``render_image`` (which shows the picture to the model) and the
+    OCR tool (which sends it to a recognition model), so both get every check
+    below; they differ only in the size and encoding they want afterwards.
+    ``max_edge`` only steers JPEG draft decoding, which may return an image
+    larger than it but never needlessly huge.
 
     Blocking and CPU-bound, so callers run it in a worker thread: decoding a
     24 MP JPEG is a few hundred milliseconds of C, and one process serves every
@@ -1400,26 +1534,22 @@ def render_image(
        materialises at full size just to be shrunk afterwards;
     3. EXIF orientation, because phones record the sensor's rotation rather
        than the photo's and an upright scan decoded sideways is unreadable;
-    4. colour mode flattened (see ``_flatten``);
-    5. downscaled to ``max_edge`` on the long side, never enlarged — upscaling
-       adds bytes and invents no detail.
+    4. colour mode flattened (see ``_flatten``).
     """
-    try:
-        img = PILImage.open(BytesIO(data), formats=_PILLOW_FORMATS)
-    except PILImage.DecompressionBombError as exc:
-        # Pillow's own global ceiling, which it applies while parsing the
-        # header. Caught separately so the caller gets the size explanation
-        # rather than a generic "could not be decoded".
-        raise ValueError(
-            f"This image declares more pixels than this server will decode "
-            f"({exc}). Use seafile_get_download_link to fetch it directly."
-        ) from None
-    except Exception as exc:
-        raise ValueError(
-            f"This file looks like an image but could not be decoded: {exc}"
-        ) from None
-
+    img = _open_image(data)
     source_format = img.format or "unknown"
+    frames = getattr(img, "n_frames", 1)
+
+    if frame:
+        # A multi-page TIFF stores each page as a frame, with its own size.
+        try:
+            img.seek(frame)
+        except (EOFError, ValueError):
+            raise ValueError(
+                f"This image has {frames} frame(s); frame {frame + 1} does not "
+                f"exist."
+            ) from None
+
     # The header's dimensions, which are what the bomb check must use — it has
     # to run before anything is decoded. They are the *stored* raster, so for an
     # EXIF-rotated photo the axes are swapped relative to how it is meant to be
@@ -1427,7 +1557,6 @@ def render_image(
     # since the caller quotes it to the model and "3000x4000" for a picture the
     # model is looking at in landscape is just wrong.
     header_width, header_height = img.size
-    frames = getattr(img, "n_frames", 1)
 
     # Checked against the header, before a pixel is decoded. Not done by
     # raising PILImage.MAX_IMAGE_PIXELS: that global is shared with python-pptx
@@ -1457,6 +1586,34 @@ def render_image(
             f"This file looks like an image but could not be decoded: {exc}"
         ) from None
 
+    return DecodedImage(
+        image=img,
+        source_format=source_format,
+        source_width=source_width,
+        source_height=source_height,
+        frames=frames,
+    )
+
+
+def render_image(
+    data: bytes,
+    max_edge: int = DEFAULT_MAX_IMAGE_EDGE_PX,
+    max_bytes: int = DEFAULT_MAX_IMAGE_MB * 1024 * 1024,
+) -> RenderedImage:
+    """Decode, downscale and re-encode an image so a model can look at it.
+
+    Raises ValueError on anything that cannot be decoded, rather than returning
+    something broken — the same contract as every other extractor here, and
+    what lets ``_handle_errors`` turn it into a clean ToolError.
+
+    Decoding, with every safety check, is ``decode_image``. What is added here
+    is the downscale to ``max_edge`` on the long side — never enlarged, since
+    upscaling adds bytes and invents no detail — and an encoding that fits
+    ``max_bytes``. Blocking and CPU-bound: run it in a worker thread.
+    """
+    decoded = decode_image(data, max_edge)
+    img = decoded.image
+
     downscaled = max(img.size) > max_edge
     if downscaled:
         img.thumbnail((max_edge, max_edge), PILImage.Resampling.LANCZOS)
@@ -1468,11 +1625,11 @@ def render_image(
         image_format=image_format,
         width=final.width,
         height=final.height,
-        source_format=source_format,
-        source_width=source_width,
-        source_height=source_height,
+        source_format=decoded.source_format,
+        source_width=decoded.source_width,
+        source_height=decoded.source_height,
         downscaled=downscaled or final.size != img.size,
-        frames=frames,
+        frames=decoded.frames,
     )
 
 

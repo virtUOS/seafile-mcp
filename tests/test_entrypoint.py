@@ -10,7 +10,9 @@ from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from seafile_mcp.__main__ import RequireCredential, probe_search_support
+from seafile_mcp import ocr
+from seafile_mcp.__main__ import RequireCredential, _ocr_startup_probe, probe_search_support
+from seafile_mcp.config import Settings
 
 from .conftest import SERVER
 
@@ -86,3 +88,77 @@ async def test_search_probe_degrades_when_seafile_is_unreachable():
             side_effect=httpx.ConnectError("refused")
         )
         assert await probe_search_support() is False
+
+
+# --------------------------------------------------------------------------- #
+# OCR probe
+# --------------------------------------------------------------------------- #
+
+OCR_URL = "http://gpu.test:8010/v1"
+
+
+def _ocr_settings(**kw) -> Settings:
+    return Settings(
+        SEAFILE_SERVER_URL=SERVER,
+        ocr_url=OCR_URL,
+        ocr_model="lightonai/LightOnOCR-2-1B",
+        **kw,
+    )
+
+
+def _models(*ids: str) -> httpx.Response:
+    return httpx.Response(
+        200, json={"object": "list", "data": [{"id": i, "object": "model"} for i in ids]}
+    )
+
+
+async def test_ocr_probe_confirms_the_model_is_served(caplog):
+    with respx.mock:
+        respx.get(f"{OCR_URL}/models").mock(return_value=_models("lightonai/LightOnOCR-2-1B"))
+        assert await ocr.probe_service(_ocr_settings()) == "ok"
+
+
+async def test_ocr_probe_warns_when_the_model_is_not_served(caplog):
+    with respx.mock:
+        respx.get(f"{OCR_URL}/models").mock(return_value=_models("some/other-model"))
+        assert await ocr.probe_service(_ocr_settings()) == "model_missing"
+
+    assert "some/other-model" in caplog.text
+    assert "SEAFILE_MCP_OCR_MODEL" in caplog.text
+
+
+async def test_ocr_probe_sends_the_ocr_key():
+    with respx.mock:
+        route = respx.get(f"{OCR_URL}/models").mock(
+            return_value=_models("lightonai/LightOnOCR-2-1B")
+        )
+        await ocr.probe_service(_ocr_settings(ocr_api_key="k"))
+
+    assert route.calls[0].request.headers["authorization"] == "Bearer k"
+
+
+@pytest.mark.parametrize(
+    "mock,expected",
+    [
+        ({"side_effect": httpx.ConnectError("refused")}, "unreachable"),
+        ({"return_value": httpx.Response(401)}, "error"),
+        ({"return_value": httpx.Response(200, text="<html>")}, "error"),
+    ],
+)
+async def test_ocr_probe_only_warns_when_the_service_is_not_ready(mock, expected):
+    """vLLM takes minutes to load a model. The probe must not take OCR away
+    from a server that booted first; it only says what it found."""
+    with respx.mock:
+        respx.get(f"{OCR_URL}/models").mock(**mock)
+        assert await ocr.probe_service(_ocr_settings()) == expected
+
+
+def test_the_startup_probe_runs_in_its_own_loop_and_cleans_up():
+    """Run from main() via asyncio.run, before uvicorn's loop exists. The
+    client it opened must be closed, or the first real OCR call would reuse
+    a connection bound to a loop that no longer runs."""
+    with respx.mock:
+        respx.get(f"{OCR_URL}/models").mock(side_effect=httpx.ConnectError("refused"))
+        assert _ocr_startup_probe(_ocr_settings()) == "unreachable"
+
+    assert ocr._client is None

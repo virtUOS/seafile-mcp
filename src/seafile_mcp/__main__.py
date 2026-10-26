@@ -12,8 +12,9 @@ from starlette.middleware import Middleware
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from . import ocr
 from ._http import close_http_client, get_http_client
-from .config import get_settings
+from .config import Settings, get_settings
 from .safety import install_redaction
 from .server import build_server
 
@@ -103,6 +104,23 @@ async def _startup_probe(force: str | None) -> bool:
         await close_http_client()
 
 
+def _ocr_startup_probe(settings: Settings) -> str:
+    """Log whether the OCR service is ready. Never decides registration.
+
+    Runs in its own short-lived loop, before uvicorn's exists, so the client it
+    opened is closed again here: a pooled connection bound to a finished loop
+    would break the first real OCR call.
+    """
+
+    async def run() -> str:
+        try:
+            return await ocr.probe_service(settings)
+        finally:
+            await ocr.close_ocr_client()
+
+    return asyncio.run(run())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="seafile-mcp")
     parser.add_argument(
@@ -127,13 +145,16 @@ def main(argv: list[str] | None = None) -> int:
     import os
 
     search_enabled = asyncio.run(_startup_probe(os.environ.get("SEAFILE_MCP_ENABLE_SEARCH")))
+    if settings.ocr_enabled:
+        _ocr_startup_probe(settings)
 
     mcp = build_server(search_enabled=search_enabled, settings=settings)
     logger.info(
-        "seafile-mcp starting: upstream=%s mode=%s search=%s transport=%s",
+        "seafile-mcp starting: upstream=%s mode=%s search=%s ocr=%s transport=%s",
         settings.server_url,
         settings.mode.value,
         "on" if search_enabled else "off",
+        f"on({settings.ocr_model})" if settings.ocr_enabled else "off",
         args.transport,
     )
 

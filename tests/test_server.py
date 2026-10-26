@@ -28,7 +28,10 @@ from .conftest import (
     ods_bytes,
     odt_bytes,
     pdf_with_pages,
+    png_bytes,
     pptx_with_slides,
+    scanned_pdf,
+    word_image,
     xlsx_with_sheets,
 )
 
@@ -872,3 +875,632 @@ async def test_an_oversized_text_file_offers_no_offset_past_the_download_cut(
     assert last.next_offset is None
     assert last.truncated is True
     assert "seafile_get_download_link" in last.notice
+
+
+# --------------------------------------------------------------------------- #
+# OCR
+# --------------------------------------------------------------------------- #
+
+OCR_URL = "http://gpu.test:8010/v1"
+OCR_COMPLETIONS = f"{OCR_URL}/chat/completions"
+
+
+def _ocr_settings(mode: Mode = Mode.read_only, **kw) -> Settings:
+    return Settings(
+        SEAFILE_SERVER_URL=SERVER,
+        mode=mode,
+        ocr_url=OCR_URL,
+        ocr_model="lightonai/LightOnOCR-2-1B",
+        **kw,
+    )
+
+
+async def _ocr_server(monkeypatch, token: str = "acct", **kw):
+    monkeypatch.setattr(
+        auth, "get_http_headers", lambda **_: {"authorization": f"Token {token}"}
+    )
+    return build_server(search_enabled=False, settings=_ocr_settings(**kw))
+
+
+async def _ocr_tool(monkeypatch, token: str = "acct", **kw):
+    server = await _ocr_server(monkeypatch, token, **kw)
+    return await server.get_tool("seafile_ocr_file")
+
+
+def _mock_ocr(text: str = "transcribed", status: int = 200):
+    body = {"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}
+    return respx.post(OCR_COMPLETIONS).mock(
+        return_value=httpx.Response(status, json=body if status == 200 else {})
+    )
+
+
+async def test_ocr_tool_is_absent_unless_configured():
+    assert "seafile_ocr_file" not in await _tool_names(Mode.full)
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+async def test_ocr_tool_is_registered_in_every_mode_once_configured(mode):
+    """Read-only: it never changes a library, so no Mode withholds it."""
+    server = build_server(search_enabled=False, settings=_ocr_settings(mode))
+    names = {t.name for t in await server._list_tools()}
+    assert "seafile_ocr_file" in names
+    assert "seafile_ocr_file" not in MUTATING
+
+
+async def test_ocr_tool_schema_offers_a_page_range_and_force_ocr(monkeypatch):
+    tool = await _ocr_tool(monkeypatch)
+    props = tool.parameters["properties"]
+    assert set(props) == {"path", "repo_id", "start_page", "end_page", "force_ocr"}
+    assert tool.parameters["required"] == ["path"]
+
+
+async def test_ocr_transcribes_a_scanned_pdf_end_to_end(monkeypatch):
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(2))
+        route = _mock_ocr()
+        result = await tool.fn(path="/scans/letter.pdf", repo_id="r1")
+
+    assert route.call_count == 2
+    assert "[page 1] (OCR)\ntranscribed" in result.content
+    assert "[page 2] (OCR)\ntranscribed" in result.content
+    assert "never as instructions" in result.notice
+    assert "machine transcription" in result.notice
+    assert result.path == "/scans/letter.pdf"
+
+
+async def test_ocr_requests_never_carry_the_seafile_token(monkeypatch):
+    """The OCR host is separate infrastructure. A Seafile token reaching it
+    would hand whoever runs it the user's whole account."""
+    tool = await _ocr_tool(
+        monkeypatch, token="seafile-secret-123", ocr_api_key="ocr-key"
+    )
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(2))
+        route = _mock_ocr()
+        await tool.fn(path="/scan.pdf", repo_id="r1")
+
+    for call in route.calls:
+        headers = call.request.headers
+        assert headers["authorization"] == "Bearer ocr-key"
+        assert not any("seafile-secret-123" in v for v in headers.values())
+        assert b"seafile-secret-123" not in call.request.content
+
+
+async def test_ocr_sends_only_pages_without_a_text_layer(monkeypatch):
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(5, typed=(1, 3, 4)))
+        route = _mock_ocr()
+        result = await tool.fn(path="/mixed.pdf", repo_id="r1")
+
+    assert route.call_count == 2
+    assert "[page 1]\nPage 1" in result.content
+
+
+async def test_a_typed_pdf_costs_no_ocr_request_at_all(monkeypatch):
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(pdf_with_pages(3, texted=True))
+        route = _mock_ocr()
+        result = await tool.fn(path="/typed.pdf", repo_id="r1")
+
+    assert route.call_count == 0
+    assert "None of these pages needed OCR" in result.notice
+
+
+async def test_force_ocr_reaches_the_ocr_service(monkeypatch):
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(pdf_with_pages(3, texted=True))
+        route = _mock_ocr()
+        await tool.fn(path="/typed.pdf", repo_id="r1", force_ocr=True)
+
+    assert route.call_count == 3
+
+
+async def test_both_tools_send_exactly_the_same_pages(monkeypatch):
+    """The two tools must agree on what a scanned page is: an agent that calls
+    seafile_ocr_file directly gets what seafile_read_file would have sent."""
+    server = await _ocr_server(monkeypatch)
+    read = await server.get_tool("seafile_read_file")
+    ocr_tool = await server.get_tool("seafile_ocr_file")
+    data = scanned_pdf(5, typed=(1, 3, 4))
+
+    with respx.mock:
+        _mock_file_download(data)
+        via_read = _mock_ocr()
+        await read.fn(path="/mixed.pdf", repo_id="r1")
+    with respx.mock:
+        _mock_file_download(data)
+        via_ocr = _mock_ocr()
+        await ocr_tool.fn(path="/mixed.pdf", repo_id="r1")
+
+    assert via_read.call_count == via_ocr.call_count == 2
+
+
+async def test_read_file_says_there_is_no_ocr_when_none_is_configured(monkeypatch):
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(pdf_with_pages(3, texted=True, blank=(2,)))
+        result = await tool.fn(path="/mixed.pdf", repo_id="r1")
+
+    assert "page 2" in result.notice
+    assert "does not do OCR" in result.notice
+    assert "seafile_ocr_file" not in result.notice
+
+
+async def test_ocr_refuses_a_file_that_is_neither_pdf_nor_image(monkeypatch):
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(b"just some notes")
+        with pytest.raises(ToolError, match="PDFs and images only"):
+            await tool.fn(path="/notes.txt", repo_id="r1")
+
+
+async def test_ocr_validates_the_page_range_before_downloading(monkeypatch):
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock(assert_all_called=False):
+        download = respx.get(f"{SERVER}/f/abc/").mock(
+            return_value=httpx.Response(200, content=scanned_pdf(1))
+        )
+        with pytest.raises(ToolError, match="1-indexed"):
+            await tool.fn(path="/scan.pdf", repo_id="r1", start_page=0)
+
+    assert not download.called
+
+
+async def test_ocr_is_confined_by_a_repo_pin(monkeypatch):
+    tool = await _ocr_tool(monkeypatch, token="acct:repo_id:r1")
+
+    with respx.mock:
+        respx.get(ACCOUNT_URL).mock(
+            return_value=httpx.Response(200, json={"email": "a@b.c"})
+        )
+        respx.get(f"{SERVER}/api2/repos/r1/").mock(
+            return_value=httpx.Response(200, json={"id": "r1"})
+        )
+        with pytest.raises(ToolError, match="confined to library 'r1'"):
+            await tool.fn(path="/scan.pdf", repo_id="somebody-elses-repo")
+
+
+async def test_ocr_failing_on_every_page_is_a_clean_tool_error(monkeypatch):
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(2))
+        _mock_ocr(status=503)
+        with pytest.raises(ToolError, match="HTTP 503"):
+            await tool.fn(path="/scan.pdf", repo_id="r1")
+
+
+async def test_an_ocr_result_over_the_size_cap_says_to_narrow_the_range(monkeypatch):
+    """No offset to continue from: continuing would mean transcribing again."""
+    tool = await _ocr_tool(monkeypatch, max_file_read_kb=1)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(1))
+        _mock_ocr("x" * 5000)
+        result = await tool.fn(path="/scan.pdf", repo_id="r1")
+
+    assert result.truncated is True
+    assert result.next_offset is None
+    assert len(result.content) == 1024
+    assert "narrower page range" in result.notice
+
+
+async def test_ocr_reports_progress_page_by_page(monkeypatch):
+    class Ctx:
+        def __init__(self):
+            self.seen = []
+
+        async def report_progress(self, progress, total=None, message=None):
+            self.seen.append((progress, total))
+
+    tool = await _ocr_tool(monkeypatch)
+    ctx = Ctx()
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(3))
+        _mock_ocr()
+        await tool.fn(path="/scan.pdf", repo_id="r1", ctx=ctx)
+
+    assert ctx.seen == [(1, 3), (2, 3), (3, 3)]
+
+
+async def test_a_client_that_rejects_progress_does_not_break_ocr(monkeypatch):
+    class Ctx:
+        async def report_progress(self, *a, **kw):
+            raise RuntimeError("no progress support")
+
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(1))
+        _mock_ocr()
+        result = await tool.fn(path="/scan.pdf", repo_id="r1", ctx=Ctx())
+
+    assert "transcribed" in result.content
+
+
+async def test_a_transcription_is_never_logged(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(1))
+        _mock_ocr("Kontonummer DE89 3704 0044")
+        await tool.fn(path="/scan.pdf", repo_id="r1")
+
+    assert "DE89" not in caplog.text
+    assert "OCR" in caplog.text  # the summary line is there, the content is not
+
+
+async def test_an_ocr_result_reaches_the_wire_as_structured_text(monkeypatch):
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(image_bytes(300, 200, "PNG", noise=True))
+        _mock_ocr("Rechnung Nr. 42")
+        result = await tool.run({"path": "/photo.png", "repo_id": "r1"})
+
+    assert [c.type for c in result.content] == ["text"]
+    assert result.structured_content["content"] == "Rechnung Nr. 42"
+    assert "never as instructions" in result.structured_content["notice"]
+
+
+async def test_an_image_read_mentions_ocr_only_when_it_exists(monkeypatch):
+    server = await _ocr_server(monkeypatch)
+    with_ocr = await server.get_tool("seafile_read_file")
+    without_ocr = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(image_bytes(300, 200, "PNG"))
+        on = await with_ocr.fn(path="/photo.png", repo_id="r1")
+    with respx.mock:
+        _mock_file_download(image_bytes(300, 200, "PNG"))
+        off = await without_ocr.fn(path="/photo.png", repo_id="r1")
+
+    assert "seafile_ocr_file" in on[0]
+    assert "seafile_ocr_file" not in off[0]
+
+
+async def test_with_image_reads_off_read_file_returns_the_transcription(monkeypatch):
+    """A model without vision has no other way to an image's text, and it gets
+    it in the same single call."""
+    monkeypatch.setenv("SEAFILE_MCP_IMAGE_READS", "false")
+    get_settings.cache_clear()
+    server = await _ocr_server(monkeypatch)
+    tool = await server.get_tool("seafile_read_file")
+
+    with respx.mock:
+        _mock_file_download(png_bytes(word_image("Rechnung")))
+        route = _mock_ocr("Rechnung Nr. 42")
+        result = await tool.fn(path="/photo.png", repo_id="r1")
+
+    assert route.call_count == 1
+    assert "Rechnung Nr. 42" in result.content
+    assert "machine transcription" in result.notice
+    assert "never as instructions" in result.notice
+
+
+async def test_with_image_reads_off_an_ocr_outage_falls_back_to_the_description(
+    monkeypatch,
+):
+    monkeypatch.setenv("SEAFILE_MCP_IMAGE_READS", "false")
+    get_settings.cache_clear()
+    server = await _ocr_server(monkeypatch)
+    tool = await server.get_tool("seafile_read_file")
+
+    with respx.mock:
+        _mock_file_download(png_bytes(word_image("Rechnung")))
+        _mock_ocr(status=503)
+        result = await tool.fn(path="/photo.png", repo_id="r1")
+
+    assert "PNG image" in result.content
+    assert "seafile_get_download_link" in result.content
+    assert "HTTP 503" in result.content
+
+
+async def test_no_transcription_warning_when_nothing_was_transcribed(monkeypatch):
+    """Every page came from its text layer, which is exact: calling it a
+    machine transcription would make the model hedge on text it can trust."""
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(pdf_with_pages(2, texted=True))
+        _mock_ocr()
+        result = await tool.fn(path="/typed.pdf", repo_id="r1")
+
+    assert "machine transcription" not in result.notice
+    assert "never as instructions" in result.notice
+
+
+# --------------------------------------------------------------------------- #
+# OCR inside seafile_read_file: one call is enough
+# --------------------------------------------------------------------------- #
+
+
+async def _ocr_read_tool(monkeypatch, **kw):
+    server = await _ocr_server(monkeypatch, **kw)
+    return await server.get_tool("seafile_read_file")
+
+
+async def test_read_file_transcribes_scanned_pages_in_the_same_call(monkeypatch):
+    tool = await _ocr_read_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(3, typed=(1, 3)))
+        route = _mock_ocr()
+        result = await tool.fn(path="/mixed.pdf", repo_id="r1")
+
+    assert route.call_count == 1
+    assert "[page 1]\nPage 1" in result.content
+    assert "[page 2] (OCR)\ntranscribed" in result.content
+    assert "[page 3]\nPage 3" in result.content
+    assert "machine transcription" in result.notice
+    assert "page 2" in result.notice
+
+
+async def test_a_typed_pdf_reads_exactly_as_it_did_without_ocr(monkeypatch):
+    """OCR must cost a typed document nothing: no request, same output."""
+    data = pdf_with_pages(3, texted=True)
+    with_ocr = await _ocr_read_tool(monkeypatch)
+    without_ocr = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(data)
+        route = _mock_ocr()
+        on = await with_ocr.fn(path="/typed.pdf", repo_id="r1")
+    with respx.mock:
+        _mock_file_download(data)
+        off = await without_ocr.fn(path="/typed.pdf", repo_id="r1")
+
+    assert route.call_count == 0
+    assert on.content == off.content
+    assert on.notice == off.notice
+
+
+async def test_read_file_transcribes_at_most_max_pages_and_says_where_to_go_on(
+    monkeypatch,
+):
+    tool = await _ocr_read_tool(monkeypatch, ocr_max_pages=2)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(5))
+        route = _mock_ocr()
+        result = await tool.fn(path="/scan.pdf", repo_id="r1")
+
+    assert route.call_count == 2
+    assert "[page 3] (no text layer; not transcribed in this call)" in result.content
+    assert "start_page=3" in result.notice
+
+
+async def test_a_bare_read_of_a_long_scan_transcribes_only_the_preview(monkeypatch):
+    """A 40-page scan read without a range must not cost 40 OCR requests."""
+    tool = await _ocr_read_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(40))
+        route = _mock_ocr()
+        await tool.fn(path="/long-scan.pdf", repo_id="r1")
+
+    assert route.call_count == 2
+
+
+async def test_read_file_never_fails_because_ocr_does(monkeypatch):
+    tool = await _ocr_read_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(3, typed=(1,)))
+        _mock_ocr(status=503)
+        result = await tool.fn(path="/mixed.pdf", repo_id="r1")
+
+    # Pages 2 and 3 render in parallel. Whichever reaches the service second may
+    # find the cool-down already started by the first and not be sent at all;
+    # either way both pages fail, and the reason names the 503.
+    assert "[page 1]\nPage 1" in result.content
+    assert "[page 2] (OCR failed: " in result.content
+    assert "[page 3] (OCR failed: " in result.content
+    assert "HTTP 503" in result.content
+    assert "start_page=2" in result.notice
+
+
+async def test_read_file_does_not_send_blank_pages(monkeypatch):
+    tool = await _ocr_read_tool(monkeypatch)
+    data = pdf_with_pages(3, texted=True, blank=(2,))
+
+    with respx.mock:
+        _mock_file_download(data)
+        route = _mock_ocr()
+        result = await tool.fn(path="/with-blank.pdf", repo_id="r1")
+
+    assert route.call_count == 0
+    assert "[page 2] (appears blank; not sent to OCR)" in result.content
+    assert "force_ocr=true" in result.notice
+
+
+async def test_a_damaged_page_is_sent_to_ocr_rather_than_failing_the_read(monkeypatch):
+    from pypdf import PageObject
+
+    real = PageObject.extract_text
+
+    def flaky(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        if "Page 2" in text:
+            raise KeyError("/Font")
+        return text
+
+    monkeypatch.setattr(PageObject, "extract_text", flaky)
+    tool = await _ocr_read_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(pdf_with_pages(3, texted=True))
+        route = _mock_ocr()
+        result = await tool.fn(path="/damaged.pdf", repo_id="r1")
+
+    assert route.call_count == 1
+    assert "[page 2] (OCR)" in result.content
+
+
+async def test_a_damaged_page_without_ocr_is_listed_not_a_crash(monkeypatch):
+    from pypdf import PageObject
+
+    real = PageObject.extract_text
+
+    def flaky(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        if "Page 2" in text:
+            raise KeyError("/Font")
+        return text
+
+    monkeypatch.setattr(PageObject, "extract_text", flaky)
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(pdf_with_pages(3, texted=True))
+        result = await tool.fn(path="/damaged.pdf", repo_id="r1")
+
+    assert "page 2" in result.notice
+    assert "Page 1" in result.content
+
+
+async def test_a_cut_result_with_ocr_pages_says_to_continue_by_page(monkeypatch):
+    """Continuing by offset would transcribe every page again: nothing is
+    cached. The page range is the way on."""
+    tool = await _ocr_read_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(2))
+        _mock_ocr("x" * 3000)
+        result = await tool.fn(path="/scan.pdf", repo_id="r1", limit=1000)
+
+    assert result.truncated is True
+    assert "start_page" in result.notice
+    assert "transcribe" in result.notice
+
+
+async def test_read_file_reports_ocr_progress(monkeypatch):
+    class Ctx:
+        def __init__(self):
+            self.seen = []
+
+        async def report_progress(self, progress, total=None, message=None):
+            self.seen.append((progress, total))
+
+    tool = await _ocr_read_tool(monkeypatch)
+    ctx = Ctx()
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(2))
+        _mock_ocr()
+        await tool.fn(path="/scan.pdf", repo_id="r1", ctx=ctx)
+
+    assert ctx.seen == [(1, 2), (2, 2)]
+
+
+async def test_read_file_keeps_its_parameters(monkeypatch):
+    """ctx is injected by FastMCP, never a parameter a model sees."""
+    tool = await _ocr_read_tool(monkeypatch)
+    assert "ctx" not in tool.parameters["properties"]
+
+
+async def test_the_read_path_never_sends_the_seafile_token_to_ocr(monkeypatch):
+    tool = await _ocr_read_tool(
+        monkeypatch, token="seafile-secret-123", ocr_api_key="ocr-key"
+    )
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(2))
+        route = _mock_ocr()
+        await tool.fn(path="/scan.pdf", repo_id="r1")
+
+    assert route.call_count == 2
+    for call in route.calls:
+        assert call.request.headers["authorization"] == "Bearer ocr-key"
+        assert not any("seafile-secret-123" in v for v in call.request.headers.values())
+
+
+async def test_an_image_read_with_vision_sends_nothing_to_ocr(monkeypatch):
+    """Images stay pictures for a model that can see: transcribing every image
+    read would add seconds to each one."""
+    tool = await _ocr_read_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(png_bytes(word_image("Rechnung")))
+        route = _mock_ocr()
+        result = await tool.fn(path="/photo.png", repo_id="r1")
+
+    assert route.call_count == 0
+    assert isinstance(result, list)
+
+
+async def test_the_ocr_tool_logs_whether_ocr_was_forced(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    tool = await _ocr_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(pdf_with_pages(1, texted=True))
+        _mock_ocr()
+        await tool.fn(path="/typed.pdf", repo_id="r1", force_ocr=True)
+
+    assert "forced=True" in caplog.text
+    assert "blank=0" in caplog.text
+
+
+async def test_the_tool_descriptions_say_which_to_use(monkeypatch):
+    server = await _ocr_server(monkeypatch)
+    read = await server.get_tool("seafile_read_file")
+    ocr_tool = await server.get_tool("seafile_ocr_file")
+
+    assert "transcribed automatically" in read.description
+    assert "This tool does no OCR" not in read.description
+    assert "directly" in ocr_tool.description
+    assert "Never call both" in ocr_tool.description
+
+
+
+# --------------------------------------------------------------------------- #
+# OCR outages: a read costs one timeout at most, then none
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_hung_ocr_service_costs_a_read_one_timeout_not_one_per_page(
+    monkeypatch,
+):
+    tool = await _ocr_read_tool(monkeypatch, ocr_concurrency=1)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(5, typed=(1,)))
+        route = respx.post(OCR_COMPLETIONS).mock(side_effect=httpx.ReadTimeout("hung"))
+        result = await tool.fn(path="/scan.pdf", repo_id="r1")
+
+    assert route.call_count == 1
+    assert "[page 1]\nPage 1" in result.content
+    assert result.content.count("(OCR failed:") == 4
+
+
+async def test_reads_during_the_cool_down_do_not_wait_for_ocr(monkeypatch):
+    tool = await _ocr_read_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(2, typed=(1,)))
+        route = respx.post(OCR_COMPLETIONS).mock(side_effect=httpx.ConnectError("refused"))
+        await tool.fn(path="/scan.pdf", repo_id="r1")
+        second = await tool.fn(path="/scan.pdf", repo_id="r1")
+
+    assert route.call_count == 1
+    assert "[page 1]\nPage 1" in second.content
+    assert "temporarily unavailable" in second.content

@@ -7,11 +7,18 @@ delete tool at all.
 
 from __future__ import annotations
 
+import json
 from enum import Enum
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Any
 
-from pydantic import Field, ValidationInfo, field_validator
+from pydantic import (
+    Field,
+    SecretStr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .documents import (
@@ -38,6 +45,31 @@ def _require_positive_or_none(v: int | None, env_name: str) -> int | None:
             f"extract everything"
         )
     return v
+
+
+#: Defaults for the OCR settings. LightOnOCR's own recommendations, since it is
+#: the model this was built against: a 1540 px long edge (2048 for the
+#: LightOnOCR-3 0.8B/4B models, which an admin sets explicitly) and a
+#: temperature of 0.1, which its authors prefer to greedy decoding.
+DEFAULT_OCR_MAX_EDGE_PX = 1540
+DEFAULT_OCR_TEMPERATURE = 0.1
+
+#: Ceiling on SEAFILE_MCP_OCR_MAX_EDGE_PX. A rendered page is held in memory
+#: for every request in flight, so this bounds what OCR can allocate at once:
+#: 4096 x 4096 RGB is 48 MB, times SEAFILE_MCP_OCR_CONCURRENCY.
+MAX_OCR_EDGE_PX = 4096
+
+#: Request-body keys SEAFILE_MCP_OCR_EXTRA_BODY may not set, and where each one
+#: comes from instead. model and the two sampling limits have settings of their
+#: own; messages is the image this server sends; stream must stay off because
+#: the response is parsed as one JSON document.
+_OCR_RESERVED_KEYS = {
+    "model": "SEAFILE_MCP_OCR_MODEL",
+    "messages": "this server (it is the page image)",
+    "stream": "this server (responses are read whole, never streamed)",
+    "max_tokens": "SEAFILE_MCP_OCR_MAX_TOKENS",
+    "temperature": "SEAFILE_MCP_OCR_TEMPERATURE",
+}
 
 
 class Mode(str, Enum):
@@ -160,6 +192,44 @@ class Settings(BaseSettings):
     #: Mutating calls per token per minute.
     mutation_rate_limit: int = 30
 
+    #: OCR, off unless both ocr_url and ocr_model are set. When on, the
+    #: seafile_ocr_file tool is registered; when off it does not exist. The
+    #: endpoint is any OpenAI-compatible chat-completions API serving a vision
+    #: model — vLLM serving LightOnOCR is the reference. Deployment-fixed for
+    #: the same reason server_url is: a caller who could choose it could send
+    #: every page they can read to a host of their own.
+    ocr_url: str | None = None
+    ocr_model: str | None = None
+    #: Sent as a Bearer token to the OCR service only. Never a Seafile
+    #: credential, and never logged: SecretStr keeps it out of repr too.
+    ocr_api_key: SecretStr | None = None
+    #: Text sent alongside each page image. LightOnOCR takes none (an empty
+    #: prompt is its plain transcription mode); olmOCR and general vision
+    #: models need an instruction here.
+    ocr_prompt: str = ""
+    ocr_max_edge_px: int = DEFAULT_OCR_MAX_EDGE_PX
+    #: Pages one seafile_ocr_file call may cover. Bounds GPU time per call and
+    #: how long a client waits, since every page costs seconds.
+    ocr_max_pages: int = 10
+    #: OCR requests in flight across *every* user of this process, so one
+    #: caller's long document cannot flood the OCR service.
+    ocr_concurrency: int = 4
+    #: Per page, not per call.
+    ocr_timeout_s: float = 120.0
+    #: Per page. Bounds a model that starts repeating itself; a page that
+    #: reaches it is flagged in the result rather than silently cut.
+    ocr_max_tokens: int = 4096
+    ocr_temperature: float = DEFAULT_OCR_TEMPERATURE
+    #: JSON object merged into every request body, for model-specific knobs
+    #: (LightOnOCR-3 wants {"chat_template_kwargs": {"enable_thinking": false}}).
+    #: NoDecode: parsed by _parse_ocr_extra_body, which can say what is wrong
+    #: and lets an empty value mean "nothing".
+    ocr_extra_body: Annotated[dict[str, Any], NoDecode] = Field(default_factory=dict)
+    #: Don't send pages that look blank (the empty back of a duplex scan, a
+    #: solid colour) to the OCR model. A heuristic that errs towards sending;
+    #: this is its off switch. A caller can still force a page through.
+    ocr_skip_blank_pages: bool = True
+
     http_host: str = "0.0.0.0"
     http_port: int = 8000
     http_path: str = "/mcp"
@@ -210,6 +280,103 @@ class Settings(BaseSettings):
                 f"SEAFILE_MCP_{info.field_name.upper()} must be a positive integer"
             )
         return v
+
+    @field_validator("ocr_url", "ocr_model", "ocr_api_key", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, v: object) -> object:
+        # docker-compose forwards every variable as ${VAR:-}, so a deployment
+        # that never mentions OCR still passes empty strings for all of it.
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @field_validator("ocr_url")
+    @classmethod
+    def _check_ocr_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip().rstrip("/")
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("SEAFILE_MCP_OCR_URL must start with http:// or https://")
+        return v
+
+    @field_validator("ocr_max_pages", "ocr_concurrency", "ocr_max_tokens")
+    @classmethod
+    def _validate_ocr_count(cls, v: int, info: ValidationInfo) -> int:
+        if v < 1:
+            raise ValueError(
+                f"SEAFILE_MCP_{info.field_name.upper()} must be a positive integer"
+            )
+        return v
+
+    @field_validator("ocr_max_edge_px")
+    @classmethod
+    def _validate_ocr_edge(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("SEAFILE_MCP_OCR_MAX_EDGE_PX must be a positive integer")
+        if v > MAX_OCR_EDGE_PX:
+            raise ValueError(
+                f"SEAFILE_MCP_OCR_MAX_EDGE_PX must be at most {MAX_OCR_EDGE_PX}: "
+                f"each page in flight is held in memory at that size"
+            )
+        return v
+
+    @field_validator("ocr_timeout_s")
+    @classmethod
+    def _validate_ocr_timeout(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("SEAFILE_MCP_OCR_TIMEOUT_S must be greater than 0")
+        return v
+
+    @field_validator("ocr_temperature")
+    @classmethod
+    def _validate_ocr_temperature(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("SEAFILE_MCP_OCR_TEMPERATURE must not be negative")
+        return v
+
+    @field_validator("ocr_extra_body", mode="before")
+    @classmethod
+    def _parse_ocr_extra_body(cls, v: object) -> object:
+        if isinstance(v, str):
+            if not v.strip():
+                return {}
+            try:
+                v = json.loads(v)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"SEAFILE_MCP_OCR_EXTRA_BODY must be a JSON object, e.g. "
+                    f'{{"top_p": 0.9}}: {exc}'
+                ) from None
+        if not isinstance(v, dict):
+            raise ValueError(
+                'SEAFILE_MCP_OCR_EXTRA_BODY must be a JSON object, e.g. {"top_p": 0.9}'
+            )
+        for key, owner in _OCR_RESERVED_KEYS.items():
+            if key in v:
+                raise ValueError(
+                    f"SEAFILE_MCP_OCR_EXTRA_BODY may not set {key!r}; that comes "
+                    f"from {owner}."
+                )
+        return v
+
+    @model_validator(mode="after")
+    def _ocr_needs_url_and_model(self) -> "Settings":
+        # Refused rather than treated as "off": an admin who set one of the two
+        # meant to turn OCR on, and a server that silently runs without it would
+        # let them believe it is on.
+        if (self.ocr_url is None) != (self.ocr_model is None):
+            missing = "SEAFILE_MCP_OCR_MODEL" if self.ocr_model is None else "SEAFILE_MCP_OCR_URL"
+            raise ValueError(
+                f"OCR is half-configured: set {missing} as well, or unset both "
+                f"SEAFILE_MCP_OCR_URL and SEAFILE_MCP_OCR_MODEL to run without OCR."
+            )
+        return self
+
+    @property
+    def ocr_enabled(self) -> bool:
+        """True if seafile_ocr_file should be registered."""
+        return self.ocr_url is not None
 
     def allows(self, tool_name: str) -> bool:
         """True if `tool_name` should be registered under the active mode."""

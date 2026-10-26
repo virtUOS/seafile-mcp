@@ -11,21 +11,27 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from seafile_mcp import auth, safety
 from seafile_mcp._http import close_http_client
-from seafile_mcp.config import get_settings
+from seafile_mcp.config import Settings, get_settings
+from seafile_mcp.ocr import close_ocr_client
 
 SERVER = "https://seafile.test"
 
 
-def pdf_with_pages(count: int, *, texted: bool = False) -> bytes:
+def pdf_with_pages(
+    count: int, *, texted: bool = False, blank: tuple[int, ...] = ()
+) -> bytes:
     """Build a PDF with `count` pages, either blank or each holding real text.
 
     Used by both test_documents.py (unit tests on the extraction module) and
     test_server.py (end-to-end tests through the seafile_read_file tool).
+    `blank` lists 1-indexed pages left without text even when `texted` is set:
+    the shape of a typed document with scanned pages in it, which is what the
+    OCR text-layer check has to tell apart.
     """
     writer = PdfWriter()
     for i in range(count):
         page = writer.add_blank_page(width=200, height=200)
-        if texted:
+        if texted and i + 1 not in blank:
             content = DecodedStreamObject()
             content.set_data(f"BT /F1 12 Tf 10 100 Td (Page {i + 1}) Tj ET".encode())
             content_ref = writer._add_object(content)
@@ -43,6 +49,82 @@ def pdf_with_pages(count: int, *, texted: bool = False) -> bytes:
             page[NameObject("/Contents")] = content_ref
     buf = BytesIO()
     writer.write(buf)
+    return buf.getvalue()
+
+
+def scanned_pdf(count: int, *, typed: tuple[int, ...] = ()) -> bytes:
+    """A PDF shaped like a scan: every page shows visible marks but has no text
+    layer, except the 1-indexed pages in `typed`, which carry real text.
+
+    The stand-in for a scanned page in OCR tests. A *blank* page from
+    pdf_with_pages would not do: the OCR path rightly refuses to spend a
+    request on a page with nothing on it.
+    """
+    writer = PdfWriter()
+    for i in range(count):
+        page = writer.add_blank_page(width=200, height=200)
+        content = DecodedStreamObject()
+        if i + 1 in typed:
+            content.set_data(f"BT /F1 12 Tf 10 100 Td (Page {i + 1}) Tj ET".encode())
+            font = DictionaryObject(
+                {
+                    NameObject("/Type"): NameObject("/Font"),
+                    NameObject("/Subtype"): NameObject("/Type1"),
+                    NameObject("/BaseFont"): NameObject("/Helvetica"),
+                }
+            )
+            page[NameObject("/Resources")] = DictionaryObject(
+                {
+                    NameObject("/Font"): DictionaryObject(
+                        {NameObject("/F1"): writer._add_object(font)}
+                    )
+                }
+            )
+        else:
+            # Filled shapes: ink a renderer draws, with no text for pypdf to find.
+            content.set_data(b"0 g 20 120 160 20 re f 20 80 120 20 re f 20 40 140 20 re f")
+        page[NameObject("/Contents")] = writer._add_object(content)
+    buf = BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def word_image(
+    word: str = "Ja",
+    *,
+    size: int = 15,
+    width: int = 1089,
+    height: int = 1540,
+    inverted: bool = False,
+    speckles: int = 0,
+):
+    """A page-sized PIL image holding one small word, and nothing else.
+
+    The default is an A4 page rendered at a 1540 px long edge with a word at
+    roughly 8 pt: the smallest content the blank-page check must never skip.
+    `speckles` scatters isolated dark pixels, the way a scanner does on an
+    empty page; `inverted` is white text on black, like a slide.
+    """
+    import random
+
+    from PIL import Image as PILImage
+    from PIL import ImageDraw, ImageFont
+
+    bg, fg = ("black", "white") if inverted else ("white", "black")
+    img = PILImage.new("RGB", (width, height), bg)
+    if word:
+        ImageDraw.Draw(img).text(
+            (width // 2, height // 2), word, fill=fg, font=ImageFont.load_default(size=size)
+        )
+    rng = random.Random(1)
+    for _ in range(speckles):
+        img.putpixel((rng.randrange(width), rng.randrange(height)), (0, 0, 0))
+    return img
+
+
+def png_bytes(img) -> bytes:
+    buf = BytesIO()
+    img.save(buf, "PNG")
     return buf.getvalue()
 
 
@@ -138,6 +220,23 @@ def image_bytes(
     return buf.getvalue()
 
 
+def multipage_tiff(sizes: list[tuple[int, int]]) -> bytes:
+    """A multi-page TIFF, one page per (width, height) — how scanners and fax
+    software store a multi-page scan. The sizes differ so a test can tell which
+    page it was handed."""
+    from PIL import Image as PILImage
+    from PIL import ImageDraw
+
+    pages = [PILImage.new("RGB", size, (250, 250, 250)) for size in sizes]
+    for page in pages:
+        # A dark bar, so no page looks blank to the OCR blank-page check.
+        w, h = page.size
+        ImageDraw.Draw(page).rectangle((2, 2, w - 3, max(h // 2, 4)), fill=(0, 0, 0))
+    buf = BytesIO()
+    pages[0].save(buf, "TIFF", save_all=True, append_images=pages[1:])
+    return buf.getvalue()
+
+
 def animated_gif_bytes(frames: int = 3) -> bytes:
     """Build an animated GIF with `frames` visibly distinct frames.
 
@@ -147,9 +246,14 @@ def animated_gif_bytes(frames: int = 3) -> bytes:
     from PIL import Image as PILImage
 
     colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (0, 255, 255)]
+    from PIL import ImageDraw
+
     images = [
         PILImage.new("RGB", (20, 20), colors[i % len(colors)]) for i in range(frames)
     ]
+    for img in images:
+        # A dark bar, so no frame looks blank to the OCR blank-page check.
+        ImageDraw.Draw(img).rectangle((2, 2, 17, 8), fill=(0, 0, 0))
     buf = BytesIO()
     images[0].save(buf, "GIF", save_all=True, append_images=images[1:])
     return buf.getvalue()
@@ -339,13 +443,20 @@ CFB_MAGIC_BYTES = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 32
 def _env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SEAFILE_SERVER_URL", SERVER)
     monkeypatch.delenv("SEAFILE_API_TOKEN", raising=False)
-    monkeypatch.delenv("SEAFILE_MCP_MODE", raising=False)
-    monkeypatch.delenv("SEAFILE_MCP_ALLOWED_EMAIL_DOMAINS", raising=False)
+    # Hermetic: no developer's own configuration reaches a test. Settings reads
+    # the working directory's .env as well as the environment, so a deployment
+    # configured in the repo's .env — OCR on, another page size, an API key —
+    # silently changed what the suite saw. Neither source is consulted here;
+    # every test states the settings it depends on.
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    for name in [n for n in os.environ if n.startswith("SEAFILE_MCP_")]:
+        monkeypatch.delenv(name)
     get_settings.cache_clear()
     auth.clear_mode_cache()
     safety.reset_state()
     yield
     asyncio.run(close_http_client())
+    asyncio.run(close_ocr_client())
     get_settings.cache_clear()
     auth.clear_mode_cache()
     safety.reset_state()

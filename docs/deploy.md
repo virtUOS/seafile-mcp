@@ -131,6 +131,154 @@ a notice about an image it cannot see and no way to tell that is what happened.
 **Verify this against your own client before relying on it.** Image-block support
 varies, and this server cannot detect what the host does with what it sends.
 
+## OCR (optional)
+
+Off by default. When you configure an OCR model, scanned documents become readable
+in **one call**: `seafile_read_file` transcribes a PDF's scanned pages itself, and an
+extra tool, `seafile_ocr_file`, is registered for direct use. Without that
+configuration neither exists and nothing else changes.
+
+What it does, and what it deliberately does not do:
+
+- **`seafile_read_file` transcribes only what has no text.** It extracts the text
+  layer as always; only pages without one go to the OCR model, and come back marked
+  `(OCR)` in the same result. A typed PDF reads byte for byte as before and costs no
+  GPU time. One read transcribes at most `SEAFILE_MCP_OCR_MAX_PAGES` pages; the long
+  document preview still applies, so a bare read of a 200-page scan transcribes only
+  its first 2 pages, and the notice says how to continue.
+- **A read never fails because OCR did.** If the OCR host is down or a page times
+  out, the typed pages still come back and the failed pages are marked with how to
+  retry. An outage — a timeout, a refused or dropped connection, or HTTP
+  429/502/503/504 — costs a read at most the requests already in flight, so one
+  timeout rather than one per page. For the next 60 s no OCR request is sent at all,
+  by either tool or any user: reads return their typed pages at once and mark
+  scanned ones "temporarily unavailable". After that, the next scanned page tries
+  again, so a restarted OCR server is back in use within a minute.
+- **Blank pages are not sent** — the empty backs of a duplex scan, a solid colour. The
+  check counts ink pixels that touch other ink, so scanner speckle is ignored while a
+  single small word is enough to send a page; it errs towards sending.
+  `SEAFILE_MCP_OCR_SKIP_BLANK_PAGES=false` switches it off.
+- **`seafile_ocr_file` is for direct use**: an image's text (`seafile_read_file`
+  still shows images to a vision model as pictures), a copier "searchable PDF" whose
+  hidden text layer is garbled, or a file the agent already knows is a scan. It skips
+  pages with a text layer and blank pages too; `force_ocr=true` sends them anyway.
+  That flag is set by the model, so it is guidance rather than a lock — the page and
+  concurrency limits still apply, and the log line records `forced=True`. The pages
+  of a multi-page TIFF are treated as pages.
+- **Models without vision** (`SEAFILE_MCP_IMAGE_READS=false`): `seafile_read_file`
+  returns an image's transcription instead of "cannot be shown".
+
+### Enabling it
+
+The OCR model runs on a GPU host of its own, behind any **OpenAI-compatible
+chat-completions API**. The reference setup is vLLM serving
+[LightOnOCR](https://github.com/lightonai/LightOnOCR):
+
+```bash
+# On the GPU host
+vllm serve lightonai/LightOnOCR-2-1B \
+  --limit-mm-per-prompt '{"image": 1}' \
+  --mm-processor-cache-gb 0 --no-enable-prefix-caching \
+  --port 8010 --api-key "$OCR_API_KEY"
+```
+
+LightOnOCR's own README pins the vLLM and `transformers` versions it was tested
+with. At the time of writing it warns that one vLLM release made every model loop,
+so use their pin rather than the latest release.
+
+Then, in this server's `.env`:
+
+```bash
+SEAFILE_MCP_OCR_URL=https://gpu.example.org:8010/v1   # the base URL, ending in /v1
+SEAFILE_MCP_OCR_MODEL=lightonai/LightOnOCR-2-1B        # exactly as the server lists it
+SEAFILE_MCP_OCR_API_KEY=...                            # vLLM's --api-key, if set
+```
+
+Rebuild once, since OCR adds a dependency (`pypdfium2`, which renders PDF pages):
+`docker compose up --build -d`. The boot log then shows `ocr=on(<model>)`, followed by
+one line from a startup check against `GET /v1/models`:
+
+- `OCR service reachable and serving …`: ready.
+- `does not serve model …`: `SEAFILE_MCP_OCR_MODEL` doesn't match what the OCR server
+  lists. The log line shows what it does serve.
+- `did not answer at startup`: the OCR host is down or still loading the model, which
+  takes vLLM minutes. **The tool stays registered anyway** and reports the service
+  unavailable until it answers. The check never turns OCR off.
+
+Setting only one of `OCR_URL` and `OCR_MODEL` is a startup error. An admin who set
+one clearly meant OCR to be on, and a server that silently ran without it would hide
+the mistake.
+
+### Other models
+
+The protocol is generic, so a different model is a settings change:
+
+| Model | Change |
+|---|---|
+| LightOnOCR-3-0.8B / -3-4B | `SEAFILE_MCP_OCR_MAX_EDGE_PX=2048`, and `SEAFILE_MCP_OCR_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}`, unless vLLM already sets that with `--default-chat-template-kwargs` |
+| A model that needs an instruction (olmOCR, Qwen-VL and other general vision models) | `SEAFILE_MCP_OCR_PROMPT` set to that model's documented OCR prompt. LightOnOCR takes no prompt; an empty prompt is its plain mode |
+| Ollama, LM Studio, SGLang | Their OpenAI-compatible base URL (Ollama: `http://host:11434/v1`) and the model name they list |
+
+`SEAFILE_MCP_OCR_EXTRA_BODY` is a JSON object merged into every request, for
+model-specific knobs. In `.env`, single-quote it so its inner double quotes survive.
+It may not set `model`, `messages`, `stream`, `max_tokens` or `temperature`: this
+server owns those, and the last two have their own settings.
+
+### All OCR settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SEAFILE_MCP_OCR_URL` | unset | Base URL of the OpenAI-compatible API. Unset means OCR is off |
+| `SEAFILE_MCP_OCR_MODEL` | unset | Model name, required with the URL |
+| `SEAFILE_MCP_OCR_API_KEY` | unset | Sent as `Authorization: Bearer` to the OCR host only |
+| `SEAFILE_MCP_OCR_PROMPT` | empty | Text sent with each page image |
+| `SEAFILE_MCP_OCR_MAX_EDGE_PX` | 1540 | Long edge a page is rendered or scaled to (max 4096) |
+| `SEAFILE_MCP_OCR_MAX_PAGES` | 10 | Pages one call may transcribe, in either tool |
+| `SEAFILE_MCP_OCR_CONCURRENCY` | 4 | OCR requests in flight across **all** users of this server |
+| `SEAFILE_MCP_OCR_TIMEOUT_S` | 120 | Per page |
+| `SEAFILE_MCP_OCR_MAX_TOKENS` | 4096 | Output per page; a page that reaches it is flagged as possibly cut short or looping |
+| `SEAFILE_MCP_OCR_TEMPERATURE` | 0.1 | LightOnOCR's recommendation |
+| `SEAFILE_MCP_OCR_EXTRA_BODY` | `{}` | JSON object merged into each request |
+| `SEAFILE_MCP_OCR_SKIP_BLANK_PAGES` | `true` | Don't send pages that look blank |
+
+### What leaves this host
+
+Page images of library files are sent to the OCR host. Treat it with the same
+data-protection standing as Seafile itself: run it on infrastructure covered by the
+same rules, not on a public API unless that has been approved. Across hosts, use HTTPS
+or a private network, and set vLLM's `--api-key`.
+
+The OCR host never receives a Seafile token. OCR uses an HTTP client of its own,
+separate from the Seafile one, and sends only `SEAFILE_MCP_OCR_API_KEY`. The OCR
+endpoint is fixed by this configuration, never by a caller, for the same reason the
+Seafile URL is.
+
+Nothing is cached, and transcriptions are never logged, only page counts and timings.
+Asking for the same page twice transcribes it twice.
+
+### Capacity and client timeouts
+
+Each page is one request. `SEAFILE_MCP_OCR_CONCURRENCY` caps how many are in flight
+for the whole server; vLLM batches them on the GPU. A call that transcribes takes
+roughly `OCR_MAX_PAGES / OCR_CONCURRENCY` × the per-page latency, and longer while
+other users are transcribing too. **This now applies to `seafile_read_file` as well**:
+reading a scanned PDF waits for its transcription, while a typed PDF is as fast as
+ever. Measure the per-page latency on your GPU. Your MCP client's tool timeout must be
+longer than that worst case. In LibreChat that is `timeout` (milliseconds) on the
+server's entry in `librechat.yaml`. Both tools send a progress notification after
+each page, which some clients use to keep the call alive.
+
+The worst case during an outage is different: one `SEAFILE_MCP_OCR_TIMEOUT_S`
+(120 s by default), for the read that discovers it. If your client gives up sooner,
+that one read times out on the user's side — typed pages included — even though the
+server would have returned them. Either raise the client's timeout above it, or
+lower `SEAFILE_MCP_OCR_TIMEOUT_S` to fit, keeping it comfortably above the slowest
+page you have measured.
+
+There is no per-user OCR quota. The global concurrency cap keeps the GPU from being
+flooded, and waiting requests are served in arrival order, so users interleave rather
+than queue behind one long document.
+
 ## Text encoding
 
 Plain-text files are decoded as UTF-8 unless a byte-order mark declares otherwise.
