@@ -1504,3 +1504,105 @@ async def test_reads_during_the_cool_down_do_not_wait_for_ocr(monkeypatch):
     assert route.call_count == 1
     assert "[page 1]\nPage 1" in second.content
     assert "temporarily unavailable" in second.content
+
+
+
+# --------------------------------------------------------------------------- #
+# OCR debug trail through seafile_read_file
+# --------------------------------------------------------------------------- #
+
+
+async def test_read_file_logs_its_ocr_decision_at_debug(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="seafile_mcp.ocr")
+    tool = await _ocr_read_tool(monkeypatch, ocr_max_pages=1, ocr_api_key="ocr-key-xyz")
+
+    with respx.mock:
+        _mock_file_download(scanned_pdf(3, typed=(1,)))
+        _mock_ocr("Kontonummer DE89 3704 0044")
+        await tool.fn(path="/scan.pdf", repo_id="r1")
+
+    log = caplog.text
+    assert "read_file /scan.pdf" in log
+    assert "sending page 2" in log
+    assert "deferring page 3" in log
+    assert "/scan.pdf p2: transcribed" in log
+    assert "DE89" not in log
+    assert "ocr-key-xyz" not in log
+
+
+
+# --------------------------------------------------------------------------- #
+# Debug trail (SEAFILE_MCP_DEBUG=server)
+# --------------------------------------------------------------------------- #
+
+
+def _server_log(caplog) -> str:
+    return "\n".join(
+        r.getMessage() for r in caplog.records if r.name == "seafile_mcp.server"
+    )
+
+
+async def test_tool_calls_are_traced_without_the_content_they_carry(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="seafile_mcp.server")
+    monkeypatch.setattr(
+        auth, "get_http_headers", lambda **_: {"authorization": "Token acct"}
+    )
+    server = build_server(search_enabled=False, settings=_settings(Mode.safe_write))
+    write = await server.get_tool("seafile_write_file")
+
+    with respx.mock:
+        respx.get(ACCOUNT_URL).mock(
+            return_value=httpx.Response(200, json={"email": "a@b.c"})
+        )
+        respx.get(f"{SERVER}/api2/repos/r1/upload-link/").mock(
+            return_value=httpx.Response(200, json=f"{SERVER}/upload/x")
+        )
+        respx.post(f"{SERVER}/upload/x").mock(return_value=httpx.Response(200))
+        await write.fn(path="/notes/a.txt", content="TOP-SECRET-BODY", repo_id="r1")
+
+    log = _server_log(caplog)
+    assert "seafile_write_file(" in log
+    assert "path='/notes/a.txt'" in log
+    assert "content=<15 chars>" in log
+    assert "TOP-SECRET-BODY" not in log
+    assert "seafile_write_file: done in" in log
+
+
+async def test_a_failed_tool_call_is_traced_with_its_error(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="seafile_mcp.server")
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        respx.get(ACCOUNT_URL).mock(
+            return_value=httpx.Response(200, json={"email": "a@b.c"})
+        )
+        respx.get(f"{SERVER}/api2/repos/r1/file/").mock(
+            return_value=httpx.Response(404, json={"error_msg": "File not found"})
+        )
+        with pytest.raises(ToolError):
+            await tool.fn(path="/missing.pdf", repo_id="r1")
+
+    log = _server_log(caplog)
+    assert "seafile_read_file: failed in" in log
+    assert "SeafileAPIError" in log
+
+
+async def test_read_file_traces_what_it_detected_and_returned(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="seafile_mcp.server")
+    tool = await _read_file_tool(monkeypatch)
+
+    with respx.mock:
+        _mock_file_download(docx_with_paragraphs(["Hallo Welt"]))
+        await tool.fn(path="/a.docx", repo_id="r1")
+
+    log = _server_log(caplog)
+    assert "read_file /a.docx: Word," in log
+    assert "Hallo Welt" not in log

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 import pytest
 import respx
@@ -607,3 +609,69 @@ async def test_an_oversized_text_file_starting_with_bm_is_still_a_prefix(monkeyp
 
     assert got.partial is True
     assert got.data == body[: 1024 * 1024]
+
+
+
+# --------------------------------------------------------------------------- #
+# Debug trail (SEAFILE_MCP_DEBUG=client)
+# --------------------------------------------------------------------------- #
+
+
+def _ours(caplog) -> str:
+    """This server's log lines only: httpx logs its own request lines."""
+    return "\n".join(
+        r.getMessage() for r in caplog.records if r.name.startswith("seafile_mcp")
+    )
+
+
+#: Shaped like a Seafile file-server link, whose path carries an access token.
+_DL_TOKEN = "0b9f3c55-1111-4222-8333-944455556666"
+
+
+async def test_api_calls_are_traced_by_endpoint_never_by_token(caplog):
+    caplog.set_level(logging.DEBUG, logger="seafile_mcp.client")
+    secret = Credentials(token="acct-secret-xyz", mode=TokenMode.account)
+
+    with respx.mock:
+        respx.get(f"{SERVER}/api2/repos/r1/dir/").mock(
+            return_value=httpx.Response(200, json=[])
+        )
+        await SeafileClient(secret).list_directory("r1", "/docs")
+
+    log = _ours(caplog)
+    assert "GET /api2/repos/r1/dir/ -> 200" in log
+    assert "acct-secret-xyz" not in log
+
+
+async def test_a_download_is_traced_without_its_link(caplog):
+    caplog.set_level(logging.DEBUG, logger="seafile_mcp.client")
+    link = f"{SERVER}/seafhttp/files/{_DL_TOKEN}/q1.pdf"
+
+    with respx.mock:
+        respx.get(f"{SERVER}/api2/repos/r1/file/").mock(
+            return_value=httpx.Response(200, json=link)
+        )
+        respx.get(link).mock(return_value=httpx.Response(200, content=b"hello world"))
+        await SeafileClient(ACCOUNT).read_file_bytes("r1", "/q1.pdf")
+
+    log = _ours(caplog)
+    assert "download: 11 bytes" in log
+    assert _DL_TOKEN not in log
+    assert "hello world" not in log
+
+
+async def test_an_upload_is_traced_without_its_link_or_content(caplog):
+    caplog.set_level(logging.DEBUG, logger="seafile_mcp.client")
+    link = f"{SERVER}/seafhttp/upload-api/{_DL_TOKEN}"
+
+    with respx.mock:
+        respx.get(f"{SERVER}/api2/repos/r1/upload-link/").mock(
+            return_value=httpx.Response(200, json=link)
+        )
+        respx.post(link).mock(return_value=httpx.Response(200))
+        await SeafileClient(ACCOUNT).upload_bytes("r1", "/", "a.txt", b"TOP-SECRET-BODY")
+
+    log = _ours(caplog)
+    assert "upload: 15 bytes -> 200" in log
+    assert _DL_TOKEN not in log
+    assert "TOP-SECRET-BODY" not in log

@@ -8,6 +8,7 @@ import logging
 import sys
 
 import httpx
+from pydantic import ValidationError
 from starlette.middleware import Middleware
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -86,6 +87,14 @@ class RequireCredential:
         await self.app(scope, receive, send)
 
 
+#: Libraries whose own INFO/DEBUG lines are kept out of the log. httpx writes
+#: every request's full URL at INFO — a search query in plain text, and the
+#: download and upload links Seafile hands out, whose path is an access token.
+#: Pinned to WARNING whatever --log-level says; SEAFILE_MCP_DEBUG=client traces
+#: requests by endpoint instead.
+_QUIET_LIBRARIES = ("httpx", "httpcore")
+
+
 def _configure_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -93,6 +102,21 @@ def _configure_logging(level: str) -> None:
         stream=sys.stderr,
     )
     install_redaction()
+    for name in _QUIET_LIBRARIES:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def _describe_config_errors(exc: ValidationError) -> str:
+    """Which settings were refused and why — never the values.
+
+    pydantic's own message repeats each rejected input, and a refused setting
+    may be exactly the one carrying a secret, such as an OCR URL with a
+    password in it.
+    """
+    return "; ".join(
+        f"{'.'.join(str(part) for part in error['loc']) or 'settings'}: {error['msg']}"
+        for error in exc.errors(include_input=False, include_url=False)
+    )
 
 
 async def _startup_probe(force: str | None) -> bool:
@@ -102,6 +126,46 @@ async def _startup_probe(force: str | None) -> bool:
         return await probe_search_support()
     finally:
         await close_http_client()
+
+
+def _configure_debug(settings: Settings) -> None:
+    """Raise the areas named in SEAFILE_MCP_DEBUG to DEBUG, and say so.
+
+    Only this server's own loggers (``seafile_mcp.<area>``, or the
+    ``seafile_mcp`` parent for "all"): the HTTP libraries' DEBUG output is a
+    flood and carries URLs. Announced at INFO, so debug left on in production
+    shows up in the very first lines of the log.
+    """
+    if not settings.debug:
+        return
+    if "all" in settings.debug:
+        logging.getLogger("seafile_mcp").setLevel(logging.DEBUG)
+    else:
+        for area in settings.debug:
+            logging.getLogger(f"seafile_mcp.{area}").setLevel(logging.DEBUG)
+    logger.info(
+        "Debug logging on for: %s. Decisions, counts, sizes, timings and paths "
+        "only; leave SEAFILE_MCP_DEBUG empty in production.",
+        ", ".join(settings.debug),
+    )
+    if settings.ocr_enabled and {"all", "ocr"} & set(settings.debug):
+        logging.getLogger("seafile_mcp.ocr").debug(
+            "OCR configuration: model=%s endpoint=%s max_edge=%d max_pages=%d "
+            "concurrency=%d timeout=%.0fs max_tokens=%d temperature=%s prompt=%s "
+            "extra_body_keys=%s api_key=%s skip_blank=%s",
+            settings.ocr_model,
+            settings.ocr_url,
+            settings.ocr_max_edge_px,
+            settings.ocr_max_pages,
+            settings.ocr_concurrency,
+            settings.ocr_timeout_s,
+            settings.ocr_max_tokens,
+            settings.ocr_temperature,
+            f"{len(settings.ocr_prompt)} chars" if settings.ocr_prompt else "none",
+            sorted(settings.ocr_extra_body) or "none",
+            "set" if settings.ocr_api_key is not None else "unset",
+            settings.ocr_skip_blank_pages,
+        )
 
 
 def _ocr_startup_probe(settings: Settings) -> str:
@@ -138,6 +202,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         settings = get_settings()
+    except ValidationError as exc:
+        logger.error("Configuration error: %s", _describe_config_errors(exc))
+        return 2
     except Exception as exc:
         logger.error("Configuration error: %s", exc)
         return 2
@@ -145,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     import os
 
     search_enabled = asyncio.run(_startup_probe(os.environ.get("SEAFILE_MCP_ENABLE_SEARCH")))
+    _configure_debug(settings)
     if settings.ocr_enabled:
         _ocr_startup_probe(settings)
 

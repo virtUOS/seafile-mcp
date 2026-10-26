@@ -55,19 +55,99 @@ REPO_ID_HELP = (
 )
 
 
+#: Tool arguments the debug trail may show: they name things rather than carry
+#: them. Every other argument appears as its length only — file content
+#: (seafile_write_file, seafile_upload_file), a search query, a delete's
+#: operation_id.
+_TRACED_ARGS = frozenset(
+    {
+        "path",
+        "repo_id",
+        "parent_dir",
+        "filename",
+        "dst_dir",
+        "dst_repo_id",
+        "new_name",
+        "start_page",
+        "end_page",
+        "start_slide",
+        "end_slide",
+        "sheet_name",
+        "offset",
+        "limit",
+        "force_ocr",
+    }
+)
+
+
+def _describe_args(kwargs: dict[str, Any]) -> str:
+    parts = []
+    for name, value in kwargs.items():
+        if name == "ctx" or value is None:
+            continue
+        if name in _TRACED_ARGS:
+            parts.append(f"{name}={value!r}")
+        elif isinstance(value, str):
+            parts.append(f"{name}=<{len(value)} chars>")
+        else:
+            parts.append(f"{name}=<{type(value).__name__}>")
+    return ", ".join(parts)
+
+
+def _describe_result(result: object) -> str:
+    if isinstance(result, FileContent):
+        return f"{len(result.content)} chars, truncated={result.truncated}"
+    if isinstance(result, list):
+        return f"{len(result)} item(s)"
+    return type(result).__name__
+
+
 def _handle_errors(fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
-    """Turn internal errors into clean, actionable tool errors."""
+    """Turn internal errors into clean, actionable tool errors.
+
+    Also the debug trail's one hook into every tool (SEAFILE_MCP_DEBUG=server):
+    each call, with the arguments that are safe to show, and how it ended.
+    """
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> T:
+        traced = logger.isEnabledFor(logging.DEBUG)
+        started = time.monotonic()
+        if traced:
+            logger.debug("%s(%s)", fn.__name__, _describe_args(kwargs))
+
+        def failed(exc: BaseException) -> None:
+            if traced:
+                logger.debug(
+                    "%s: failed in %.2fs: %s: %s",
+                    fn.__name__,
+                    time.monotonic() - started,
+                    exc.__class__.__name__,
+                    exc,
+                )
+
         try:
-            return await fn(*args, **kwargs)
-        except ToolError:
+            result = await fn(*args, **kwargs)
+        except ToolError as exc:
+            failed(exc)
             raise
         except SeafileMCPError as exc:
+            failed(exc)
             raise ToolError(str(exc)) from None
         except ValueError as exc:
+            failed(exc)
             raise ToolError(str(exc)) from None
+        except Exception as exc:
+            failed(exc)
+            raise
+        if traced:
+            logger.debug(
+                "%s: done in %.2fs, %s",
+                fn.__name__,
+                time.monotonic() - started,
+                _describe_result(result),
+            )
+        return result
 
     return wrapper
 
@@ -320,7 +400,11 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
             "sheet_name": sheet_name,
         }
 
+        # Named for the debug trail's one line per read; the branches below
+        # decide the format, this only records which one did.
+        fmt = "text"
         if documents.is_pdf(raw):
+            fmt = "PDF"
             _reject_other_format_params(path, "PDF", param_values)
             # start_page/end_page passed through as-is (not defaulted here): only
             # extract_pdf_text can tell "caller gave nothing" apart from "caller
@@ -338,6 +422,25 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
                 + documents.PDF_EXTRACTION_NOTICE
                 + documents.page_notice(result)
             )
+            if ocr_service is not None:
+                empty = set(result.empty_pages)
+                ocr.logger.debug(
+                    "read_file %s: pages %d-%d; text layer on %s; no text layer "
+                    "on %s; sending %s; deferring %s",
+                    normalize_path(path),
+                    result.first_page,
+                    result.last_page,
+                    ocr.pages_or_none(
+                        [
+                            n
+                            for n in range(result.first_page, result.last_page + 1)
+                            if n not in empty
+                        ]
+                    ),
+                    ocr.pages_or_none(list(result.empty_pages)),
+                    ocr.pages_or_none(list(result.empty_pages[: ocr_service.max_pages])),
+                    ocr.pages_or_none(list(result.empty_pages[ocr_service.max_pages :])),
+                )
             if ocr_service is not None and result.empty_pages:
                 # Only pages with no text layer, so a typed PDF costs nothing
                 # and comes back byte for byte as it would without OCR. Capped
@@ -347,7 +450,7 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
                 deferred = list(result.empty_pages[len(to_ocr) :])
                 try:
                     ocr_results = await ocr_service.transcribe_pdf_pages(
-                        raw, to_ocr, _progress_reporter(ctx)
+                        raw, to_ocr, _progress_reporter(ctx), label=normalize_path(path)
                     )
                 except (ocr.OcrError, ValueError) as exc:
                     # A read never fails because OCR did: the typed pages are
@@ -376,10 +479,12 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
                 sum(r.status == "blank" for r in ocr_results.values()),
             )
         elif documents.is_docx(raw):
+            fmt = "Word"
             _reject_other_format_params(path, None, param_values)
             text = await asyncio.to_thread(documents.extract_docx_text, raw)
             notice = UNTRUSTED_NOTICE + documents.DOCX_EXTRACTION_NOTICE
         elif documents.is_pptx(raw):
+            fmt = "PowerPoint"
             _reject_other_format_params(path, "PowerPoint", param_values)
             result = await asyncio.to_thread(
                 documents.extract_pptx_text,
@@ -403,6 +508,7 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
                 + documents.slide_notice(result)
             )
         elif documents.is_xlsx(raw):
+            fmt = "Excel"
             _reject_other_format_params(path, "Excel", param_values)
             result = await asyncio.to_thread(
                 documents.extract_xlsx_text,
@@ -424,10 +530,12 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
                 + documents.sheet_notice(result)
             )
         elif documents.is_odt(raw):
+            fmt = "OpenDocument text"
             _reject_other_format_params(path, None, param_values)
             text = await asyncio.to_thread(documents.extract_odt_text, raw)
             notice = UNTRUSTED_NOTICE + documents.ODT_EXTRACTION_NOTICE
         elif documents.is_ods(raw):
+            fmt = "OpenDocument spreadsheet"
             _reject_other_format_params(path, "Excel", param_values)
             result = await asyncio.to_thread(
                 documents.extract_ods_text,
@@ -450,6 +558,7 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
                 + documents.ods_sheet_notice(result)
             )
         elif documents.is_odp(raw):
+            fmt = "OpenDocument presentation"
             _reject_other_format_params(path, "PowerPoint", param_values)
             result = await asyncio.to_thread(
                 documents.extract_odp_text,
@@ -520,7 +629,12 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
                 if ocr_service is not None:
                     try:
                         ocr_result = await ocr_service.transcribe(
-                            raw, None, None, False, _progress_reporter(ctx)
+                            raw,
+                            None,
+                            None,
+                            False,
+                            _progress_reporter(ctx),
+                            label=normalize_path(path),
                         )
                     except (ocr.OcrError, ValueError) as exc:
                         ocr_failure = f" OCR was attempted but failed: {exc}"
@@ -582,6 +696,7 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
         else:
             _reject_other_format_params(path, None, param_values)
             decoded = await asyncio.to_thread(documents.decode_text, raw)
+            fmt = f"text ({decoded.codec})"
             # In a worker thread like every other extractor: decoding the whole
             # buffer rather than a 512 KB prefix is what stops a multi-byte
             # character being cut in half at the cap, and at max_download_mb it
@@ -603,6 +718,17 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
         # deck or workbook this pages *within* the range already selected:
         # units first, then characters of whatever they produced.
         page = documents.page_text(text, offset, limit, cap)
+        logger.debug(
+            "read_file %s: %s, %d bytes%s, %d chars extracted, %d returned from "
+            "offset %d",
+            normalize_path(path),
+            fmt,
+            len(raw),
+            " (download cut at the size cap)" if download.partial else "",
+            page.total_chars,
+            len(page.text),
+            offset or 0,
+        )
         content = page.text
         truncated = page.next_offset is not None
         next_offset = page.next_offset
@@ -758,7 +884,12 @@ def build_server(*, search_enabled: bool, settings: Settings | None = None) -> F
 
             started = time.monotonic()
             result = await ocr_service.transcribe(
-                raw, start_page, end_page, force_ocr, _progress_reporter(ctx)
+                raw,
+                start_page,
+                end_page,
+                force_ocr,
+                _progress_reporter(ctx),
+                label=p,
             )
             # Counts and timings only: the transcription is library content and
             # never goes to the log.

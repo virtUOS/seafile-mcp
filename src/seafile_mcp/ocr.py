@@ -47,6 +47,7 @@ import asyncio
 import base64
 import logging
 import math
+import re
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable
@@ -94,6 +95,12 @@ class OcrPage(NamedTuple):
     #: The model stopped because it reached max_tokens, not because the page
     #: ended: the end may be missing, or the model may have been looping.
     hit_token_limit: bool = False
+    #: From the response's ``usage``, when the server reports it. The prompt
+    #: count is mostly the page image — what has to fit vLLM's --max-model-len
+    #: alongside max_tokens. For the debug trail only.
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    finish_reason: str | None = None
 
 
 class OcrEngine(Protocol):
@@ -215,10 +222,11 @@ class OpenAICompatibleOcr:
             ) from None
 
         if resp.status_code != 200:
-            # The body goes to the log, cut short, and never to the model: it is
-            # the OCR server talking about itself, not about the document.
+            # Its message goes to the log and never to the model: it is the OCR
+            # server talking about itself. Never the raw body — see
+            # _error_message.
             logger.warning(
-                "OCR service returned HTTP %s: %s", resp.status_code, resp.text[:200]
+                "OCR service returned HTTP %s: %s", resp.status_code, _error_message(resp)
             )
             error = (
                 OcrUnavailable if resp.status_code in _OUTAGE_STATUSES else OcrError
@@ -226,9 +234,11 @@ class OpenAICompatibleOcr:
             raise error(f"The OCR service returned HTTP {resp.status_code}.")
 
         try:
-            choice = resp.json()["choices"][0]
+            body = resp.json()
+            choice = body["choices"][0]
             content = choice["message"]["content"]
             finish_reason = choice.get("finish_reason")
+            usage = body.get("usage") or {}
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             logger.warning(
                 "OCR service returned an unexpected body (%d bytes)", len(resp.content)
@@ -247,7 +257,55 @@ class OpenAICompatibleOcr:
             )
         else:
             raise OcrError(_UNREADABLE)
-        return OcrPage(text.strip(), finish_reason == "length")
+        return OcrPage(
+            text.strip(),
+            finish_reason == "length",
+            _count(usage, "prompt_tokens"),
+            _count(usage, "completion_tokens"),
+            finish_reason if isinstance(finish_reason, str) else None,
+        )
+
+
+#: A data: URL, or any long unbroken run of base64 — how a page image looks
+#: when an error message quotes the request back.
+_ECHOED_DATA = re.compile(r"data:[^\s'\",]+|[A-Za-z0-9+/=]{32,}")
+
+
+def _error_message(resp: httpx.Response) -> str:
+    """An OCR server's own one-line explanation of an error, fit for a log.
+
+    Never its raw body: a validation error can echo the request, and the
+    request is a page image of someone's file. Takes the human message from
+    the usual shapes — OpenAI/vLLM ``message``, ``error.message``, FastAPI
+    ``detail`` (a pydantic ``msg``, without its ``input``) — and blanks out
+    anything that still looks like image data.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return "(no error message in the response)"
+    message: object = None
+    if isinstance(body, dict):
+        error = body.get("error")
+        detail = body.get("detail")
+        message = body.get("message")
+        if message is None and isinstance(error, dict):
+            message = error.get("message")
+        if message is None and isinstance(error, str):
+            message = error
+        if message is None and isinstance(detail, str):
+            message = detail
+        if message is None and isinstance(detail, list) and detail:
+            first = detail[0]
+            message = first.get("msg") if isinstance(first, dict) else None
+    if not isinstance(message, str):
+        return "(no error message in the response)"
+    return _ECHOED_DATA.sub("<data>", message)[:200]
+
+
+def _count(usage: object, key: str) -> int | None:
+    value = usage.get(key) if isinstance(usage, dict) else None
+    return value if isinstance(value, int) else None
 
 
 async def probe_service(settings: Settings) -> str:
@@ -312,8 +370,8 @@ _INK_DELTA = 64
 _BLANK_MAX_INK = 16
 
 
-def _looks_blank(img: PILImage.Image) -> bool:
-    """True if a page has nothing on it worth sending to an OCR model.
+def _ink_count(img: PILImage.Image) -> int:
+    """Ink pixels that touch other ink: the blank check's measure.
 
     The background is the most common grey level rather than assumed white, so
     an inverted slide — light text on dark — is judged the same way as paper.
@@ -326,7 +384,12 @@ def _looks_blank(img: PILImage.Image) -> bool:
     # The 3x3 mean of the ink mask is 255/9 (28) for a lone pixel and at
     # least 2*255/9 (57) for one with an ink neighbour; 42 splits them.
     supported = ink.filter(ImageFilter.BoxBlur(1)).point(lambda v: 255 if v >= 42 else 0)
-    return ImageChops.multiply(ink, supported).histogram()[255] < _BLANK_MAX_INK
+    return ImageChops.multiply(ink, supported).histogram()[255]
+
+
+def _looks_blank(img: PILImage.Image) -> bool:
+    """True if a page has nothing on it worth sending to an OCR model."""
+    return _ink_count(img) < _BLANK_MAX_INK
 
 
 def _png(img: PILImage.Image) -> bytes:
@@ -337,11 +400,25 @@ def _png(img: PILImage.Image) -> bytes:
     return buf.getvalue()
 
 
-def _encode(img: PILImage.Image, check_blank: bool) -> tuple[bytes, bool]:
-    """(png, looks_blank). A blank page is never encoded: it is not sent."""
-    if check_blank and _looks_blank(img):
-        return b"", True
-    return _png(img), False
+class Rendered(NamedTuple):
+    """A page ready to send, or judged blank and not encoded at all."""
+
+    png: bytes
+    blank: bool
+    width: int
+    height: int
+    #: _ink_count, or -1 when neither the blank check nor the debug trail
+    #: needed it, so it was not measured.
+    ink: int
+
+
+def _encode(img: PILImage.Image, check_blank: bool) -> Rendered:
+    """Encode a page, unless it is blank — a blank page is never sent."""
+    measure = check_blank or logger.isEnabledFor(logging.DEBUG)
+    ink = _ink_count(img) if measure else -1
+    if check_blank and ink < _BLANK_MAX_INK:
+        return Rendered(b"", True, img.width, img.height, ink)
+    return Rendered(_png(img), False, img.width, img.height, ink)
 
 
 class _PdfPages:
@@ -375,7 +452,7 @@ class _PdfPages:
                 found[n] = text
         return found
 
-    def render(self, n: int, check_blank: bool) -> tuple[bytes, bool]:
+    def render(self, n: int, check_blank: bool) -> Rendered:
         """Render page ``n`` (1-indexed) so its long edge is ``max_edge``.
 
         A PDF page is vector, so unlike an image it is rendered *at* the size
@@ -434,7 +511,7 @@ class _ImagePages:
     def text_layers(self, first: int, last: int) -> dict[int, str]:
         return {}
 
-    def render(self, n: int, check_blank: bool) -> tuple[bytes, bool]:
+    def render(self, n: int, check_blank: bool) -> Rendered:
         """Decode frame ``n`` with every check render_image has, then shrink it
         to ``max_edge`` (never enlarging it) and flatten it onto white."""
         img = documents.decode_image(self._data, self._max_edge, frame=n - 1).image
@@ -571,6 +648,7 @@ class OcrService:
         numbers: list[int],
         check_blank: bool,
         progress: Progress | None,
+        label: str,
     ) -> dict[int, PageResult]:
         """Render and transcribe exactly ``numbers``, concurrently.
 
@@ -585,29 +663,74 @@ class OcrService:
         — not the rest of this call's, not anyone else's. A read during an
         outage costs at most the requests already in flight, one timeout, and
         reads after it none.
+
+        Every step is in the debug trail (SEAFILE_MCP_DEBUG=ocr): counts,
+        sizes and timings, never the text that came back.
         """
         done = 0
 
         async def one(n: int) -> PageResult:
             nonlocal done
+            queued = time.monotonic()
             try:
                 # Rendered inside the semaphore, so no more pages exist in
                 # memory at once than there are requests in flight.
                 async with self._slots:
-                    png, blank = await asyncio.to_thread(pages.render, n, check_blank)
-                    if blank:
+                    started = time.monotonic()
+                    try:
+                        page_image = await asyncio.to_thread(pages.render, n, check_blank)
+                    except ValueError as exc:
+                        logger.debug("%s p%d: could not be rendered: %s", label, n, exc)
+                        raise
+                    logger.debug(
+                        "%s p%d: rendered %dx%d in %.2fs (waited %.2fs for a slot), "
+                        "ink=%s, png=%s",
+                        label,
+                        n,
+                        page_image.width,
+                        page_image.height,
+                        time.monotonic() - started,
+                        started - queued,
+                        page_image.ink if page_image.ink >= 0 else "not measured",
+                        "not encoded" if page_image.blank else f"{len(page_image.png)} bytes",
+                    )
+                    if page_image.blank:
                         # Local, so still true while the service is down.
+                        logger.debug(
+                            "%s p%d: looks blank (ink %d < %d), not sent",
+                            label, n, page_image.ink, _BLANK_MAX_INK,
+                        )
                         return PageResult("blank")
                     # Checked after waiting for a slot: meanwhile another page,
                     # of this call or anyone's, may have found the service down.
                     skip = self._outage_reason()
                     if skip is not None:
+                        logger.debug("%s p%d: not sent, cool-down active: %s", label, n, skip)
                         return PageResult("failed", reason=skip)
+                    sent = time.monotonic()
                     try:
-                        page = await self.engine.recognize(png)
-                    except OcrUnavailable as exc:
-                        self._enter_outage(str(exc))
+                        page = await self.engine.recognize(page_image.png)
+                    except OcrError as exc:
+                        outage = isinstance(exc, OcrUnavailable)
+                        logger.debug(
+                            "%s p%d: failed after %.2fs: %s (%s)",
+                            label, n, time.monotonic() - sent, exc,
+                            "outage" if outage else "this page only",
+                        )
+                        if outage:
+                            self._enter_outage(str(exc))
                         raise
+                    logger.debug(
+                        "%s p%d: transcribed %d chars in %.2fs, finish=%s, "
+                        "tokens prompt=%s completion=%s",
+                        label,
+                        n,
+                        len(page.text),
+                        time.monotonic() - sent,
+                        page.finish_reason or "?",
+                        page.prompt_tokens if page.prompt_tokens is not None else "?",
+                        page.completion_tokens if page.completion_tokens is not None else "?",
+                    )
                     return PageResult("ocr", page.text, page.hit_token_limit)
             finally:
                 done += 1
@@ -632,6 +755,8 @@ class OcrService:
         end_page: int | None,
         force_ocr: bool,
         progress: Progress | None = None,
+        *,
+        label: str = "file",
     ) -> OcrResult:
         """Transcribe a PDF's or an image's pages, for seafile_ocr_file.
 
@@ -657,8 +782,19 @@ class OcrService:
                 {} if force_ocr else await asyncio.to_thread(pages.text_layers, first, last)
             )
             wanted = [n for n in range(first, last + 1) if n not in text_layers]
+            logger.debug(
+                "%s: pages %d-%d of %d%s; text layer on %s; sending %s%s",
+                label,
+                first,
+                last,
+                pages.count,
+                " (cut to the per-call cap)" if clamped else "",
+                pages_or_none(sorted(text_layers)),
+                pages_or_none(wanted),
+                " (force_ocr)" if force_ocr else "",
+            )
             results = await self._run(
-                pages, wanted, self.skip_blank and not force_ocr, progress
+                pages, wanted, self.skip_blank and not force_ocr, progress, label
             )
         finally:
             await asyncio.to_thread(pages.close)
@@ -689,7 +825,12 @@ class OcrService:
         )
 
     async def transcribe_pdf_pages(
-        self, data: bytes, numbers: list[int], progress: Progress | None = None
+        self,
+        data: bytes,
+        numbers: list[int],
+        progress: Progress | None = None,
+        *,
+        label: str = "file",
     ) -> dict[int, PageResult]:
         """Transcribe exactly these pages of a PDF, for seafile_read_file.
 
@@ -701,9 +842,14 @@ class OcrService:
             return {}
         pages = await asyncio.to_thread(_PdfPages, data, self.max_edge)
         try:
-            return await self._run(pages, numbers, self.skip_blank, progress)
+            return await self._run(pages, numbers, self.skip_blank, progress, label)
         finally:
             await asyncio.to_thread(pages.close)
+
+
+def pages_or_none(pages: list[int]) -> str:
+    """pages_phrase for the debug trail, which also has to say "none"."""
+    return documents.pages_phrase(pages) if pages else "no page"
 
 
 def _compose(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from enum import Enum
+from urllib.parse import urlsplit
 from functools import lru_cache
 from typing import Annotated, Any
 
@@ -70,6 +71,12 @@ _OCR_RESERVED_KEYS = {
     "max_tokens": "SEAFILE_MCP_OCR_MAX_TOKENS",
     "temperature": "SEAFILE_MCP_OCR_TEMPERATURE",
 }
+
+
+#: What SEAFILE_MCP_DEBUG can name. Each area is one module's logger,
+#: ``seafile_mcp.<area>``, so a module that wants debug lines needs only
+#: ``logging.getLogger(__name__)`` — and its name added here.
+DEBUG_AREAS = ("auth", "client", "ocr", "server")
 
 
 class Mode(str, Enum):
@@ -230,6 +237,13 @@ class Settings(BaseSettings):
     #: this is its off switch. A caller can still force a page through.
     ocr_skip_blank_pages: bool = True
 
+    #: Areas to log at DEBUG (see DEBUG_AREAS), comma-separated, or "all".
+    #: Empty — the default, and the production setting — means none. Debug
+    #: lines carry decisions, counts, sizes, timings and paths: never file
+    #: content, never a transcription, never a token, key or download link.
+    #: NoDecode: a plain comma-separated list, not JSON.
+    debug: Annotated[tuple[str, ...], NoDecode] = ()
+
     http_host: str = "0.0.0.0"
     http_port: int = 8000
     http_path: str = "/mcp"
@@ -298,6 +312,14 @@ class Settings(BaseSettings):
         v = v.strip().rstrip("/")
         if not v.startswith(("http://", "https://")):
             raise ValueError("SEAFILE_MCP_OCR_URL must start with http:// or https://")
+        parts = urlsplit(v)
+        if parts.username is not None or parts.password is not None:
+            # A URL is logged wherever URLs are logged. The key has a setting
+            # of its own, sent as a header and never written anywhere.
+            raise ValueError(
+                "SEAFILE_MCP_OCR_URL must not contain credentials; put the key in "
+                "SEAFILE_MCP_OCR_API_KEY instead."
+            )
         return v
 
     @field_validator("ocr_max_pages", "ocr_concurrency", "ocr_max_tokens")
@@ -358,6 +380,21 @@ class Settings(BaseSettings):
                     f"SEAFILE_MCP_OCR_EXTRA_BODY may not set {key!r}; that comes "
                     f"from {owner}."
                 )
+        return v
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def _parse_debug(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = tuple(a.strip().lower() for a in v.split(",") if a.strip())
+        unknown = [a for a in v if a not in DEBUG_AREAS and a != "all"]  # type: ignore[union-attr]
+        if unknown:
+            # Refused rather than ignored: a typo would otherwise mean "no
+            # logs", with nothing to say why.
+            raise ValueError(
+                f"SEAFILE_MCP_DEBUG names unknown area(s) {', '.join(unknown)}; "
+                f"valid areas are {', '.join(DEBUG_AREAS)}, or all."
+            )
         return v
 
     @model_validator(mode="after")

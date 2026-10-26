@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 from io import BytesIO
 
 import httpx
@@ -871,3 +872,150 @@ async def test_blank_pages_are_still_recognised_during_an_outage():
     results = await service.transcribe_pdf_pages(pdf_with_pages(1), [1])
 
     assert results[1].status == "blank"
+
+
+
+# --------------------------------------------------------------------------- #
+# Debug trail (SEAFILE_MCP_DEBUG=ocr): what happened to each page, never its text
+# --------------------------------------------------------------------------- #
+
+
+async def test_token_usage_and_finish_reason_are_read_from_the_answer():
+    """The prompt token count is the page image's cost — what decides whether
+    a page fits vLLM's --max-model-len."""
+    response = httpx.Response(
+        200,
+        json={
+            "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2900, "completion_tokens": 812, "total_tokens": 3712},
+        },
+    )
+    with respx.mock:
+        respx.post(COMPLETIONS).mock(return_value=response)
+        page = await ocr.OpenAICompatibleOcr(_settings()).recognize(PNG)
+
+    assert (page.prompt_tokens, page.completion_tokens, page.finish_reason) == (
+        2900,
+        812,
+        "stop",
+    )
+
+
+async def test_an_answer_without_usage_still_reads():
+    with respx.mock:
+        respx.post(COMPLETIONS).mock(return_value=_completion())
+        page = await ocr.OpenAICompatibleOcr(_settings()).recognize(PNG)
+
+    assert page.text == "transcribed"
+    assert page.prompt_tokens is None
+
+
+def _typed_scanned_blank() -> bytes:
+    from pypdf import PdfReader
+
+    writer = PdfWriter()
+    for src in (scanned_pdf(2, typed=(1,)), pdf_with_pages(1)):
+        for page in PdfReader(BytesIO(src)).pages:
+            writer.add_page(page)
+    buf = BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+async def test_the_debug_trail_follows_each_page_without_its_text(caplog):
+    caplog.set_level(logging.DEBUG, logger="seafile_mcp.ocr")
+    engine = FakeEngine(text="Kontonummer DE89 3704 0044")
+
+    await _service(engine).transcribe(
+        _typed_scanned_blank(), None, None, False, label="/scan.pdf"
+    )
+
+    log = caplog.text
+    assert "/scan.pdf: pages 1-3 of 3" in log
+    assert "text layer on page 1" in log
+    assert "/scan.pdf p2: rendered" in log
+    assert "ink=" in log
+    assert "/scan.pdf p2: transcribed" in log
+    assert "/scan.pdf p3: looks blank" in log
+    assert "DE89" not in log and "Kontonummer" not in log
+
+
+async def test_the_debug_trail_names_failures_and_the_cool_down(caplog):
+    caplog.set_level(logging.DEBUG, logger="seafile_mcp.ocr")
+    engine = FakeEngine(error=_down())
+    service = _service(engine)
+    _frozen(service)
+
+    await service.transcribe_pdf_pages(scanned_pdf(1), [1], label="/a.pdf")
+    await service.transcribe_pdf_pages(scanned_pdf(1), [1], label="/b.pdf")
+
+    assert "/a.pdf p1: failed" in caplog.text
+    assert "outage" in caplog.text
+    assert "/b.pdf p1: not sent, cool-down" in caplog.text
+
+
+async def test_nothing_is_logged_at_debug_unless_debug_is_on(caplog):
+    caplog.set_level(logging.INFO, logger="seafile_mcp.ocr")
+    await _service(FakeEngine()).transcribe(scanned_pdf(1), None, None, False, label="/x.pdf")
+
+    assert "rendered" not in caplog.text
+
+
+
+# --------------------------------------------------------------------------- #
+# An OCR server's error is logged as its message, never as its raw body
+# --------------------------------------------------------------------------- #
+
+_IMAGE_DATA = "data:image/png;base64," + "iVBORw0KGgo" + "A" * 400
+
+
+@pytest.mark.parametrize(
+    "response,kept",
+    [
+        (
+            httpx.Response(
+                400,
+                json={
+                    "object": "error",
+                    "message": "This model's maximum context length is 8192 tokens.",
+                },
+            ),
+            "maximum context length is 8192",
+        ),
+        (
+            httpx.Response(
+                422,
+                json={
+                    "detail": [
+                        {
+                            "msg": "Field required",
+                            "input": {"messages": [{"image_url": {"url": _IMAGE_DATA}}]},
+                        }
+                    ]
+                },
+            ),
+            "Field required",
+        ),
+        (
+            httpx.Response(
+                400,
+                json={"object": "error", "message": f"Bad request: {_IMAGE_DATA}"},
+            ),
+            "Bad request",
+        ),
+        (httpx.Response(500, text=f"<html>{_IMAGE_DATA}</html>"), "HTTP 500"),
+    ],
+)
+async def test_an_ocr_error_body_is_never_logged_raw(response, kept, caplog):
+    """A validation error can echo the request, and the request is a page
+    image of someone's file."""
+    caplog.set_level(logging.WARNING, logger="seafile_mcp.ocr")
+
+    with respx.mock:
+        respx.post(COMPLETIONS).mock(return_value=response)
+        with pytest.raises(ocr.OcrError):
+            await ocr.OpenAICompatibleOcr(_settings()).recognize(PNG)
+
+    assert kept in caplog.text
+    assert "iVBORw0KGgo" not in caplog.text
+    assert "AAAAAAAAAAAAAAAAAAAA" not in caplog.text

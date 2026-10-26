@@ -30,6 +30,9 @@ from ._http import get_http_client
 from .config import get_settings
 from .models import AuthError, Credentials, TokenMode
 
+#: Debug trail (SEAFILE_MCP_DEBUG=auth): how each credential was resolved,
+#: named by a fingerprint — the first 12 hex digits of its sha256, as the audit
+#: log does. Never the token, never the account's email.
 logger = logging.getLogger(__name__)
 
 _SCHEMES = ("bearer", "token")
@@ -189,6 +192,7 @@ async def resolve_credentials() -> Credentials:
     token, pinned_repo_id = split_pin(raw)
     settings = get_settings()
     key = _token_hash(token)
+    fingerprint = key[:12]
 
     # When the domain allow list is active we must re-check the account on every
     # call, so the mode cache is bypassed entirely rather than caching identity.
@@ -197,20 +201,27 @@ async def resolve_credentials() -> Credentials:
         cached = _mode_cache.get(key)
         if cached and cached[1] > time.monotonic():
             mode = cached[0]
+            logger.debug("credential %s: %s token (cached)", fingerprint, mode.value)
 
     if mode is None:
         email = await _probe_account(token)
         if email is not None:
-            _check_email_domain(email)
+            try:
+                _check_email_domain(email)
+            except AuthError:
+                logger.debug("credential %s: email domain not allowed", fingerprint)
+                raise
             mode = TokenMode.account
         elif await _probe_repo(token):
             mode = TokenMode.repo
         else:
+            logger.debug("credential %s: rejected by both probes", fingerprint)
             raise AuthError(
                 "Seafile rejected this token. Check that it is current and was "
                 "copied in full — either an account token or a library API token "
                 "works."
             )
+        logger.debug("credential %s: probed, %s token", fingerprint, mode.value)
         if not settings.allowed_email_domains:
             _mode_cache[key] = (mode, time.monotonic() + _MODE_CACHE_TTL_S)
 
@@ -221,6 +232,9 @@ async def resolve_credentials() -> Credentials:
                 "library. Drop the ':<library-id>' suffix."
             )
         await _check_pin(token, pinned_repo_id)
+        logger.debug(
+            "credential %s: pinned to library %s...", fingerprint, pinned_repo_id[:8]
+        )
 
     return Credentials(token=token, mode=mode, pinned_repo_id=pinned_repo_id)
 

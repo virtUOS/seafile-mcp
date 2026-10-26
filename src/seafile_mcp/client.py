@@ -23,7 +23,9 @@ https://plus.seafile.com/published/web-api/v2.1/library-api-tokens.md
 
 from __future__ import annotations
 
+import logging
 import posixpath
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -65,6 +67,13 @@ def normalize_path(path: str | None) -> str:
 
 def is_library_root(path: str) -> bool:
     return normalize_path(path) == "/"
+
+
+#: Debug trail (SEAFILE_MCP_DEBUG=client): one line per Seafile request, by
+#: endpoint path and status. Never a header, never a query value, never the
+#: upload or download link Seafile hands out — its path carries an access
+#: token — and never the bytes that went either way.
+logger = logging.getLogger(__name__)
 
 
 class SeafileClient:
@@ -125,9 +134,32 @@ class SeafileClient:
             )
         return repo_id or ""
 
+    def _endpoint(self, url: str) -> str:
+        """The API path of a URL this client built: what the debug trail shows."""
+        base = self._settings.server_url
+        return url[len(base) :] if url.startswith(base) else httpx.URL(url).path
+
     async def _request(self, method: str, url: str, **kw: Any) -> httpx.Response:
         headers = {**self._headers(), **kw.pop("headers", {})}
-        resp = await self._http.request(method, url, headers=headers, **kw)
+        started = time.monotonic()
+        try:
+            resp = await self._http.request(method, url, headers=headers, **kw)
+        except httpx.HTTPError as exc:
+            logger.debug(
+                "%s %s -> %s after %.2fs",
+                method,
+                self._endpoint(url),
+                exc.__class__.__name__,
+                time.monotonic() - started,
+            )
+            raise
+        logger.debug(
+            "%s %s -> %d in %.2fs",
+            method,
+            self._endpoint(url),
+            resp.status_code,
+            time.monotonic() - started,
+        )
         if resp.is_redirect:
             raise SeafileAPIError(
                 resp.status_code,
@@ -293,6 +325,7 @@ class SeafileClient:
         total = 0
         partial = False
         decided = False
+        started = time.monotonic()
 
         async with self._http.stream("GET", link) as resp:
             # Mirrors _request: the shared client has follow_redirects=False,
@@ -320,6 +353,13 @@ class SeafileClient:
                     decided = True
                     oversized = declared is not None and declared > max_bytes
                     if oversized and documents.requires_complete_file(b"".join(chunks)):
+                        logger.debug(
+                            "download: refused after %d bytes, declared %d over "
+                            "the %d MB cap",
+                            total,
+                            declared,
+                            settings.max_download_mb,
+                        )
                         raise SafetyError(
                             f"{normalize_path(path)} is "
                             f"{declared / (1024 * 1024):.1f} MB, over this "
@@ -343,6 +383,13 @@ class SeafileClient:
                     break
 
         data = b"".join(chunks)[:max_bytes]
+        logger.debug(
+            "download: %d bytes in %.2fs (declared %s)%s",
+            len(data),
+            time.monotonic() - started,
+            declared if declared is not None else "unknown",
+            ", cut at the size cap" if partial else "",
+        )
 
         # The size may have been unknown or wrong, so the same decision has to
         # hold once the cap has actually been reached.
@@ -398,8 +445,15 @@ class SeafileClient:
             "replace": "1" if replace else "0",
         }
         files = {"file": (filename, data)}
+        started = time.monotonic()
         resp = await self._http.post(
             link, data=form, files=files, headers=self._headers()
+        )
+        logger.debug(
+            "upload: %d bytes -> %d in %.2fs",
+            len(data),
+            resp.status_code,
+            time.monotonic() - started,
         )
         if resp.status_code >= 400:
             raise SeafileAPIError(resp.status_code, _short_body(resp))

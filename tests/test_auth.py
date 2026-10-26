@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 import pytest
 import respx
@@ -304,3 +306,42 @@ async def test_allowlist_bypasses_cache_so_it_cannot_be_stale(headers, monkeypat
 
     assert route.call_count == 2, "allowlist must re-check identity every call"
     assert not auth._mode_cache
+
+
+
+# --------------------------------------------------------------------------- #
+# Debug trail (SEAFILE_MCP_DEBUG=auth)
+# --------------------------------------------------------------------------- #
+
+
+async def test_credential_resolution_is_traced_by_fingerprint_only(headers, caplog):
+    caplog.set_level(logging.DEBUG, logger="seafile_mcp.auth")
+    headers(authorization="Token secret-account-token-123")
+
+    with respx.mock:
+        respx.get(ACCOUNT_URL).mock(
+            return_value=httpx.Response(200, json={"email": "person@uni.example"})
+        )
+        await resolve_credentials()
+        await resolve_credentials()
+
+    log = "\n".join(r.getMessage() for r in caplog.records if r.name == "seafile_mcp.auth")
+    fingerprint = auth._token_hash("secret-account-token-123")[:12]
+    assert f"credential {fingerprint}: probed, account token" in log
+    assert f"credential {fingerprint}: account token (cached)" in log
+    assert "secret-account-token-123" not in log
+    assert "person@uni.example" not in log
+
+
+async def test_a_rejected_credential_is_traced(headers, caplog):
+    caplog.set_level(logging.DEBUG, logger="seafile_mcp.auth")
+    headers(authorization="Token nope-nope-nope")
+
+    with respx.mock:
+        respx.get(ACCOUNT_URL).mock(return_value=httpx.Response(401))
+        respx.get(REPO_URL).mock(return_value=httpx.Response(401))
+        with pytest.raises(AuthError):
+            await resolve_credentials()
+
+    assert "rejected by both probes" in caplog.text
+    assert "nope-nope-nope" not in caplog.text

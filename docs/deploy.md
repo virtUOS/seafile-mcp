@@ -23,6 +23,10 @@ and needs the name to resolve. Users then connect to `https://$MCP_DOMAIN/mcp`; 
   Seafile token in a header.
 - Access logs omit headers, and the application redacts token-shaped strings from all log
   output including tracebacks.
+- The HTTP libraries' own request lines are off, at every log level: they carried full
+  URLs, which means search terms in plain text and the download/upload links Seafile
+  hands out, whose path is an access token. A setting the server refuses at startup is
+  reported by name and reason, never by value.
 - Nothing is persisted. Restarting the container discards all in-memory state; there is no
   volume holding user data or credentials.
 
@@ -320,6 +324,45 @@ Seafile's file search is a **Professional-edition** feature. On startup the serv
 missing feature answers `404` while a present one answers `401`. If it is absent,
 `seafile_search` is not registered and the boot log says so. Override with
 `SEAFILE_MCP_ENABLE_SEARCH=true|false`.
+
+## Debug logging
+
+For trying a deployment out, `SEAFILE_MCP_DEBUG` turns on DEBUG lines for one or
+more areas, comma-separated, or `all`:
+
+| Area | What it traces |
+|---|---|
+| `server` | Every tool call: tool, the arguments that name things (path, library, range…), how it ended and how long it took. `seafile_read_file` adds the format it detected and how much text it returned |
+| `client` | Every Seafile API request by endpoint and status, and each download or upload by size and time |
+| `auth` | How each credential was resolved — account or library token, probed or cached, pinned or not — named by a 12-character fingerprint |
+| `ocr` | The OCR configuration at startup, then for each page: text layer or not, sent, skipped as blank, held back by the cool-down or deferred; render size and time, the blank check's ink count, request time, finish reason and token usage |
+
+```bash
+SEAFILE_MCP_DEBUG=ocr,server
+docker compose up -d && docker compose logs -f seafile-mcp | grep -E 'seafile_mcp\.(ocr|server)'
+```
+
+```
+INFO  seafile_mcp Debug logging on for: ocr, server. ...
+DEBUG seafile_mcp.server seafile_read_file(path='/scans/letter.pdf', repo_id='8f2c9b10...')
+DEBUG seafile_mcp.ocr read_file /scans/letter.pdf: pages 1-3; text layer on page 1; no text layer on pages 2-3; sending pages 2-3; deferring no page
+DEBUG seafile_mcp.ocr /scans/letter.pdf p2: rendered 1448x2048 in 0.11s (waited 0.00s for a slot), ink=48211, png=903512 bytes
+DEBUG seafile_mcp.ocr /scans/letter.pdf p2: transcribed 1874 chars in 3.42s, finish=stop, tokens prompt=2911 completion=640
+DEBUG seafile_mcp.ocr /scans/letter.pdf p3: looks blank (ink 3 < 16), not sent
+DEBUG seafile_mcp.server seafile_read_file: done in 3.71s, 2210 chars, truncated=False
+```
+
+The `tokens prompt=` figure is mostly the page image: together with
+`SEAFILE_MCP_OCR_MAX_TOKENS` it is what has to fit vLLM's `--max-model-len`.
+
+**Leave it empty in production.** The startup log announces at INFO which areas are
+on, so a forgotten setting is visible. Debug lines carry decisions, counts, sizes,
+timings and file paths — never file content, a transcription, a search query, a
+token, an API key or a download/upload link (Seafile's links embed an access
+token) — but they are still far more than an operator needs day to day. The HTTP
+libraries' own log lines stay off even with `all`, and an OCR server's error is
+logged as its one-line message, never its raw response body, which can quote the
+page image it was sent.
 
 ## Operating notes
 

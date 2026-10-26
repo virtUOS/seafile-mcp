@@ -48,6 +48,9 @@ services:
       SEAFILE_MCP_OCR_SKIP_BLANK_PAGES: ${SEAFILE_MCP_OCR_SKIP_BLANK_PAGES:-true}
       SEAFILE_MCP_MUTATION_RATE_LIMIT: ${SEAFILE_MCP_MUTATION_RATE_LIMIT:-30}
       SEAFILE_MCP_REQUEST_TIMEOUT_S: ${SEAFILE_MCP_REQUEST_TIMEOUT_S:-30}
+      # Debug logs per area: auth, client, ocr, server — comma-separated, or
+      # all. Empty in production. Never file content, tokens or keys.
+      SEAFILE_MCP_DEBUG: ${SEAFILE_MCP_DEBUG:-}
     # No `ports:` — the only way in is through Caddy.
     networks: [internal]
 

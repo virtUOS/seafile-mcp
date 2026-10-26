@@ -269,3 +269,38 @@ def test_tests_never_see_a_developers_env_file(tmp_path, monkeypatch):
 
     assert settings.ocr_max_edge_px == 1540
     assert settings.ocr_api_key is None
+
+
+# --------------------------------------------------------------------------- #
+# Debug logging
+# --------------------------------------------------------------------------- #
+
+
+def test_debug_logging_is_off_by_default():
+    assert Settings(SEAFILE_SERVER_URL=SERVER).debug == ()
+
+
+def test_debug_names_areas_case_and_space_insensitively():
+    settings = Settings(SEAFILE_SERVER_URL=SERVER, debug=" ocr, CLIENT ")
+    assert settings.debug == ("ocr", "client")
+
+
+def test_debug_all_turns_on_every_area():
+    assert Settings(SEAFILE_SERVER_URL=SERVER, debug="all").debug == ("all",)
+
+
+def test_an_unknown_debug_area_refuses_to_start():
+    """A typo would otherwise mean "no logs" with no hint why."""
+    with pytest.raises(ValidationError, match="auth, client, ocr, server"):
+        Settings(SEAFILE_SERVER_URL=SERVER, debug="ocr,orc")
+
+
+
+@pytest.mark.parametrize(
+    "url", ["http://user:pass@gpu:8000/v1", "https://token@gpu.example/v1"]
+)
+def test_an_ocr_url_with_credentials_in_it_is_refused(url):
+    """Anything in the URL ends up wherever URLs are logged. The key has its
+    own setting, which is sent as a header and never logged."""
+    with pytest.raises(ValidationError, match="SEAFILE_MCP_OCR_API_KEY"):
+        Settings(SEAFILE_SERVER_URL=SERVER, ocr_url=url, ocr_model="m")
